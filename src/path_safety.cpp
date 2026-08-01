@@ -1,11 +1,17 @@
 #include "bt_download/path_safety.hpp"
 
-#include <fstream>
+#include <array>
+#include <cerrno>
+#include <cstdint>
+#include <iomanip>
+#include <random>
+#include <sstream>
 #include <system_error>
 
 #ifdef _WIN32
 #include <windows.h>
 #else
+#include <fcntl.h>
 #include <unistd.h>
 #endif
 
@@ -16,6 +22,45 @@ std::filesystem::path normalize_absolute(const std::filesystem::path& path, std:
     auto absolute = std::filesystem::absolute(path, error);
     if (error) return {};
     return std::filesystem::weakly_canonical(absolute, error);
+}
+
+std::string random_probe_suffix() {
+    std::array<std::uint32_t, 4> words{};
+    std::random_device random;
+    for (auto& word : words) word = random();
+    std::ostringstream output;
+    output << std::hex << std::setfill('0');
+    for (const auto word : words) output << std::setw(8) << word;
+    return output.str();
+}
+
+bool can_create_write_probe(const std::filesystem::path& directory) {
+    for (int attempt = 0; attempt < 16; ++attempt) {
+        const auto probe = directory / (".bt_download_write_probe_" + random_probe_suffix());
+#ifdef _WIN32
+        const HANDLE file = CreateFileW(probe.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+            FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+        if (file != INVALID_HANDLE_VALUE) {
+            CloseHandle(file);
+            return true;
+        }
+        const auto error = GetLastError();
+        if (error != ERROR_FILE_EXISTS && error != ERROR_ALREADY_EXISTS) return false;
+#else
+        int flags = O_CREAT | O_EXCL | O_WRONLY;
+#ifdef O_NOFOLLOW
+        flags |= O_NOFOLLOW;
+#endif
+        const int file = ::open(probe.c_str(), flags, 0600);
+        if (file >= 0) {
+            ::close(file);
+            ::unlink(probe.c_str());
+            return true;
+        }
+        if (errno != EEXIST) return false;
+#endif
+    }
+    return false;
 }
 
 } // namespace
@@ -30,17 +75,9 @@ PathValidation validate_save_path(const std::filesystem::path& path) {
     if (!std::filesystem::exists(normalized, error) || !std::filesystem::is_directory(normalized, error)) {
         return {false, normalized, "SAVE_PATH_UNAVAILABLE", "savePath must be an existing directory"};
     }
-#ifdef _WIN32
-    const auto process_id = GetCurrentProcessId();
-#else
-    const auto process_id = getpid();
-#endif
-    const auto probe = normalized / (".bt_download_write_probe_" + std::to_string(process_id));
-    {
-        std::ofstream output(probe, std::ios::binary | std::ios::trunc);
-        if (!output) return {false, normalized, "SAVE_PATH_NOT_WRITABLE", "savePath is not writable"};
+    if (!can_create_write_probe(normalized)) {
+        return {false, normalized, "SAVE_PATH_NOT_WRITABLE", "savePath is not writable"};
     }
-    std::filesystem::remove(probe, error);
     return {true, normalized, {}, {}};
 }
 
