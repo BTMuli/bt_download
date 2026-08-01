@@ -29,6 +29,10 @@ ctest --preset windows-x64-debug
 
 产物位于 `out/build/windows-x64-debug/bt_download.exe`。stdout 只输出协议帧；诊断日志只写 stderr。
 
+## 性能基准
+
+Windows Release 发布前应运行独立进程资源基准，采集空闲 CPU/工作集、双任务磁盘吞吐、请求延迟和进度事件频率，并保存 JSON 结果。完整命令、快速回归模式和指标口径见 [docs/performance.md](docs/performance.md)。
+
 ## 最小调用
 
 进程启动后先输出 `event.ready`。客户端随后初始化：

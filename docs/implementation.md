@@ -40,9 +40,9 @@
 - [x] 本地 Tracker/Seeder 的单文件、多文件和 Magnet 集成测试；
 - [x] 强制终止、断点恢复和安全删除 E2E；
 - [x] 磁盘不足与私有种子 E2E；
-- [ ] CPU、工作集、磁盘吞吐和事件频率基准；
+- [x] CPU、工作集、磁盘吞吐和事件频率基准；
 - [ ] Release 依赖复制、第三方许可证/SBOM；
 - [ ] Flutter Release、侧载/升级 MSIX 和 Microsoft Store 包验证；
 - [ ] BangumiToday `BtEngineClient`、任务 Store 和 UI 接入。
 
-下一阶段应建立 CPU、工作集、磁盘吞吐和事件频率基准，再开始 Flutter/MSIX 接入；这样可先用可量化指标固定伴随进程的资源预算。
+下一阶段应补齐 Release 依赖复制、第三方许可证和 SBOM，再开始 Flutter/MSIX 接入；这样可先保证伴随进程及其原生依赖能形成可审计、可复制的发布产物。

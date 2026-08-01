@@ -8,6 +8,7 @@ if(POLICY CMP0167)
 endif()
 
 option(BT_DOWNLOAD_BUILD_TESTS "Build bt_download tests" ON)
+option(BT_DOWNLOAD_BUILD_BENCHMARKS "Build bt_download performance benchmarks" ON)
 
 find_package(LibtorrentRasterbar CONFIG REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
@@ -40,6 +41,26 @@ add_executable(bt_download src/main.cpp)
 target_link_libraries(bt_download PRIVATE bt_download_core)
 
 install(TARGETS bt_download RUNTIME DESTINATION .)
+
+if(BT_DOWNLOAD_BUILD_BENCHMARKS AND WIN32)
+    add_executable(bt_download_performance_benchmark
+        tests/performance_benchmark.cpp
+    )
+    target_compile_features(bt_download_performance_benchmark PRIVATE cxx_std_20)
+    target_link_libraries(bt_download_performance_benchmark
+        PRIVATE
+            LibtorrentRasterbar::torrent-rasterbar
+            nlohmann_json::nlohmann_json
+            psapi
+            ws2_32
+    )
+    add_dependencies(bt_download_performance_benchmark bt_download)
+    if(MSVC)
+        target_compile_options(bt_download_performance_benchmark PRIVATE /W4 /permissive- /utf-8 /EHsc)
+    else()
+        target_compile_options(bt_download_performance_benchmark PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+endif()
 
 if(BT_DOWNLOAD_BUILD_TESTS)
     enable_testing()
