@@ -11,6 +11,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 
 #include <libtorrent/session.hpp>
 #include <nlohmann/json.hpp>
@@ -45,8 +46,16 @@ private:
     nlohmann::json shutdown();
 
     void require_initialized() const;
+    void finalize_locked();
     void persist_catalog_locked();
     void load_catalog_locked();
+    void request_resume_save_locked(const std::string& id, bool only_if_modified);
+    void request_periodic_resume_saves_locked();
+    void process_alerts_locked();
+    void save_final_resume_data_locked();
+    bool load_resume_data_locked(const TaskSnapshot& task, libtorrent::add_torrent_params& add);
+    void write_resume_data_locked(const std::string& id, const libtorrent::add_torrent_params& add);
+    std::optional<std::string> task_id_for_handle_locked(const libtorrent::torrent_handle& handle) const;
     TaskSnapshot& require_task_locked(const std::string& id);
     void emit_task(const std::string& event, const TaskSnapshot& task);
     bool update_snapshots_locked();
@@ -58,9 +67,12 @@ private:
     std::unique_ptr<libtorrent::session> session_;
     std::unordered_map<std::string, TaskSnapshot> tasks_;
     std::unordered_map<std::string, libtorrent::torrent_handle> handles_;
+    std::unordered_set<std::string> pending_resume_saves_;
+    std::unordered_set<std::string> deferred_resume_saves_;
     std::filesystem::path state_path_;
     nlohmann::json config_;
     std::chrono::steady_clock::time_point started_at_;
+    std::chrono::steady_clock::time_point next_resume_save_;
     std::uint64_t sequence_{0};
     std::jthread worker_;
     bool initialized_{false};

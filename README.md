@@ -9,7 +9,7 @@
 - info-hash + 规范化保存路径去重；
 - 下载目录可写检查和种子内部路径穿越检查；
 - 全局并发、速度和连接数限制；
-- 本地任务目录恢复、稳定错误模型和单调事件序号；
+- 本地任务目录与 fast-resume 恢复、稳定错误模型和单调事件序号；
 - Windows x64 Debug/Release 构建与协议/状态机/路径单元测试。
 
 完整需求和分阶段里程碑见 [docs/requirements.md](docs/requirements.md)，当前实现边界见 [docs/implementation.md](docs/implementation.md)，调用契约见 [docs/protocol.md](docs/protocol.md)。

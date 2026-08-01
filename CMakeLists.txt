@@ -47,6 +47,7 @@ if(BT_DOWNLOAD_BUILD_TESTS)
         tests/test_main.cpp
         tests/path_safety_test.cpp
         tests/protocol_test.cpp
+        tests/resume_data_test.cpp
         tests/task_test.cpp
     )
     target_link_libraries(bt_download_tests PRIVATE bt_download_core)

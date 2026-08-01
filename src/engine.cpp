@@ -13,12 +13,15 @@
 #include <thread>
 
 #include <libtorrent/add_torrent_params.hpp>
+#include <libtorrent/alert_types.hpp>
 #include <libtorrent/error_code.hpp>
 #include <libtorrent/magnet_uri.hpp>
+#include <libtorrent/read_resume_data.hpp>
 #include <libtorrent/settings_pack.hpp>
 #include <libtorrent/torrent_info.hpp>
 #include <libtorrent/torrent_status.hpp>
 #include <libtorrent/version.hpp>
+#include <libtorrent/write_resume_data.hpp>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -27,6 +30,10 @@
 namespace bt {
 namespace lt = libtorrent;
 namespace {
+
+constexpr auto resume_save_interval = std::chrono::seconds(30);
+constexpr auto final_resume_timeout = std::chrono::seconds(10);
+constexpr std::uintmax_t max_resume_file_bytes = 64U * 1024U * 1024U;
 
 std::string path_utf8(const std::filesystem::path& path) {
 #if defined(__cpp_lib_char8_t)
@@ -53,6 +60,10 @@ std::string hash_string(const lt::info_hash_t& hashes) {
 }
 
 TaskState state_from_status(const lt::torrent_status& status) {
+    if (status.state == lt::torrent_status::finished || status.state == lt::torrent_status::seeding) {
+        return TaskState::completed;
+    }
+    if ((status.flags & lt::torrent_flags::paused) != lt::torrent_flags_t{}) return TaskState::paused;
     switch (status.state) {
     case lt::torrent_status::checking_files:
     case lt::torrent_status::checking_resume_data:
@@ -61,13 +72,9 @@ TaskState state_from_status(const lt::torrent_status& status) {
         return TaskState::metadata;
     case lt::torrent_status::downloading:
         return TaskState::downloading;
-    case lt::torrent_status::finished:
-    case lt::torrent_status::seeding:
-        return TaskState::completed;
     default:
         break;
     }
-    if ((status.flags & lt::torrent_flags::paused) != lt::torrent_flags_t{}) return TaskState::paused;
     return TaskState::queued;
 }
 
@@ -101,6 +108,8 @@ lt::settings_pack make_settings(const nlohmann::json& config) {
     settings.set_int(lt::settings_pack::connections_limit, config.value("connectionsLimit", 200));
     settings.set_int(lt::settings_pack::download_rate_limit, config.value("downloadRateLimit", 0));
     settings.set_int(lt::settings_pack::upload_rate_limit, config.value("uploadRateLimit", 1024 * 1024));
+    const auto alert_mask = lt::alert_category::error | lt::alert_category::storage;
+    settings.set_int(lt::settings_pack::alert_mask, static_cast<int>(static_cast<std::uint32_t>(alert_mask)));
     settings.set_bool(lt::settings_pack::enable_dht, true);
     settings.set_bool(lt::settings_pack::enable_lsd, true);
     settings.set_bool(lt::settings_pack::enable_upnp, true);
@@ -115,7 +124,8 @@ Engine::Engine(EventSink event_sink)
     : event_sink_(std::move(event_sink)),
       config_({{"activeDownloads", 2}, {"downloadRateLimit", 0}, {"uploadRateLimit", 1024 * 1024},
                {"connectionsLimit", 200}, {"connectionsPerTask", 80}}),
-      started_at_(std::chrono::steady_clock::now()) {}
+      started_at_(std::chrono::steady_clock::now()),
+      next_resume_save_(started_at_ + resume_save_interval) {}
 
 Engine::~Engine() {
     try {
@@ -124,7 +134,7 @@ Engine::~Engine() {
             worker_.join();
         }
         std::scoped_lock lock(mutex_);
-        if (initialized_) persist_catalog_locked();
+        if (initialized_) finalize_locked();
     } catch (...) {
     }
 }
@@ -169,6 +179,7 @@ nlohmann::json Engine::initialize(const nlohmann::json& params) {
     session_ = std::make_unique<lt::session>(make_settings(config_));
     initialized_ = true;
     load_catalog_locked();
+    next_resume_save_ = std::chrono::steady_clock::now() + resume_save_interval;
     worker_ = std::jthread([this](std::stop_token token) { worker_loop(token); });
     return {{"protocolVersion", BT_DOWNLOAD_PROTOCOL_VERSION}, {"engineVersion", BT_DOWNLOAD_VERSION},
             {"libtorrentVersion", LIBTORRENT_VERSION}, {"restoredTasks", tasks_.size()}, {"config", config_}};
@@ -300,6 +311,7 @@ nlohmann::json Engine::pause_task(const nlohmann::json& params) {
         if (handle == handles_.end()) fail(-32005, "TASK_UNAVAILABLE", "task has no active torrent handle", true);
         handle->second.pause();
         task.state = TaskState::paused;
+        request_resume_save_locked(task.id, false);
         persist_catalog_locked();
         emit_task("event.taskUpdated", task);
     }
@@ -316,6 +328,7 @@ nlohmann::json Engine::resume_task(const nlohmann::json& params) {
         handle->second.resume();
         task.state = task.info_hash.empty() ? TaskState::metadata : TaskState::queued;
         task.last_error.reset();
+        request_resume_save_locked(task.id, false);
         persist_catalog_locked();
         emit_task("event.taskUpdated", task);
     }
@@ -333,6 +346,7 @@ nlohmann::json Engine::recheck_task(const nlohmann::json& params) {
     handle->second.force_recheck();
     task.state = TaskState::checking;
     task.last_error.reset();
+    request_resume_save_locked(task.id, false);
     persist_catalog_locked();
     emit_task("event.taskUpdated", task);
     return {{"task", task}};
@@ -352,7 +366,11 @@ nlohmann::json Engine::remove_task(const nlohmann::json& params) {
     }
     const auto snapshot = task;
     handles_.erase(id);
+    pending_resume_saves_.erase(id);
+    deferred_resume_saves_.erase(id);
     tasks_.erase(id);
+    std::error_code resume_error;
+    std::filesystem::remove(state_path_ / "resume" / (id + ".fastresume"), resume_error);
     persist_catalog_locked();
     event_sink_("event.taskRemoved", {{"sequence", ++sequence_}, {"task", snapshot}, {"dataDeleted", delete_data}});
     return {{"removed", true}, {"dataDeleted", delete_data}};
@@ -365,9 +383,7 @@ nlohmann::json Engine::shutdown() {
     }
     std::scoped_lock lock(mutex_);
     if (initialized_) {
-        for (auto& [id, handle] : handles_) { (void)id; handle.pause(); }
-        persist_catalog_locked();
-        session_.reset();
+        finalize_locked();
     }
     shutdown_requested_ = true;
     initialized_ = false;
@@ -376,6 +392,20 @@ nlohmann::json Engine::shutdown() {
 
 void Engine::require_initialized() const {
     if (!initialized_) fail(-32000, "NOT_INITIALIZED", "call engine.initialize first");
+}
+
+void Engine::finalize_locked() {
+    for (auto& [id, handle] : handles_) {
+        handle.pause();
+        auto& task = tasks_.at(id);
+        if (task.state != TaskState::completed) task.state = TaskState::paused;
+    }
+    save_final_resume_data_locked();
+    persist_catalog_locked();
+    pending_resume_saves_.clear();
+    deferred_resume_saves_.clear();
+    handles_.clear();
+    session_.reset();
 }
 
 void Engine::persist_catalog_locked() {
@@ -425,15 +455,20 @@ void Engine::load_catalog_locked() {
                 }
                 lt::error_code error;
                 lt::add_torrent_params add;
-                if (task.source_kind == "torrentFile") {
-                    add.ti = std::make_shared<lt::torrent_info>(task.source, error);
-                } else if (task.source_kind == "magnet") {
-                    add = lt::parse_magnet_uri(task.source, error);
+                if (!load_resume_data_locked(task, add)) {
+                    if (task.source_kind == "torrentFile") {
+                        add.ti = std::make_shared<lt::torrent_info>(task.source, error);
+                    } else if (task.source_kind == "magnet") {
+                        add = lt::parse_magnet_uri(task.source, error);
+                    }
                 }
                 if (error) throw std::runtime_error(error.message());
                 add.save_path = path_utf8(task.save_path);
+                add.max_connections = config_.value("connectionsPerTask", 80);
                 if (task.state == TaskState::paused || task.state == TaskState::completed) {
                     add.flags |= lt::torrent_flags::paused;
+                } else {
+                    add.flags &= ~lt::torrent_flags::paused;
                 }
                 auto handle = session_->add_torrent(std::move(add), error);
                 if (error) throw std::runtime_error(error.message());
@@ -452,6 +487,146 @@ void Engine::load_catalog_locked() {
         std::error_code error;
         std::filesystem::rename(catalog_path, damaged, error);
     }
+}
+
+void Engine::request_resume_save_locked(const std::string& id, bool only_if_modified) {
+    const auto found = handles_.find(id);
+    if (found == handles_.end() || !found->second.is_valid()) return;
+    if (pending_resume_saves_.contains(id)) {
+        if (!only_if_modified) deferred_resume_saves_.insert(id);
+        return;
+    }
+    auto flags = lt::torrent_handle::save_info_dict;
+    if (only_if_modified) flags |= lt::torrent_handle::only_if_modified;
+    found->second.save_resume_data(flags);
+    pending_resume_saves_.insert(id);
+}
+
+void Engine::request_periodic_resume_saves_locked() {
+    const auto now = std::chrono::steady_clock::now();
+    if (now < next_resume_save_) return;
+    for (const auto& [id, handle] : handles_) {
+        (void)handle;
+        request_resume_save_locked(id, true);
+    }
+    next_resume_save_ = now + resume_save_interval;
+}
+
+std::optional<std::string> Engine::task_id_for_handle_locked(const lt::torrent_handle& handle) const {
+    for (const auto& [id, candidate] : handles_) {
+        if (candidate == handle) return id;
+    }
+    return std::nullopt;
+}
+
+void Engine::process_alerts_locked() {
+    std::vector<lt::alert*> alerts;
+    session_->pop_alerts(&alerts);
+    for (const auto* alert : alerts) {
+        if (const auto* saved = lt::alert_cast<lt::save_resume_data_alert>(alert)) {
+            const auto id = task_id_for_handle_locked(saved->handle);
+            if (!id) continue;
+            pending_resume_saves_.erase(*id);
+            try {
+                write_resume_data_locked(*id, saved->params);
+                if (const auto task = tasks_.find(*id); task != tasks_.end()
+                    && task->second.last_error && task->second.last_error->code == "RESUME_SAVE_FAILED") {
+                    task->second.last_error.reset();
+                    emit_task("event.taskUpdated", task->second);
+                }
+            } catch (const std::exception& exception) {
+                if (const auto task = tasks_.find(*id); task != tasks_.end()) {
+                    task->second.last_error = TaskError{"RESUME_SAVE_FAILED", exception.what(), true};
+                    emit_task("event.taskUpdated", task->second);
+                }
+            }
+            if (deferred_resume_saves_.erase(*id) != 0) request_resume_save_locked(*id, false);
+            continue;
+        }
+        if (const auto* failed = lt::alert_cast<lt::save_resume_data_failed_alert>(alert)) {
+            const auto id = task_id_for_handle_locked(failed->handle);
+            if (!id) continue;
+            pending_resume_saves_.erase(*id);
+            if (failed->error != lt::errors::make_error_code(lt::errors::resume_data_not_modified)) {
+                if (const auto task = tasks_.find(*id); task != tasks_.end()) {
+                    task->second.last_error = TaskError{"RESUME_SAVE_FAILED", failed->error.message(), true};
+                    emit_task("event.taskUpdated", task->second);
+                }
+            }
+            if (deferred_resume_saves_.erase(*id) != 0) request_resume_save_locked(*id, false);
+        }
+    }
+}
+
+void Engine::save_final_resume_data_locked() {
+    if (!session_ || handles_.empty()) return;
+    process_alerts_locked();
+    for (const auto& [id, handle] : handles_) {
+        (void)handle;
+        request_resume_save_locked(id, false);
+    }
+    const auto deadline = std::chrono::steady_clock::now() + final_resume_timeout;
+    while ((!pending_resume_saves_.empty() || !deferred_resume_saves_.empty())
+           && std::chrono::steady_clock::now() < deadline) {
+        session_->wait_for_alert(std::chrono::milliseconds(100));
+        process_alerts_locked();
+    }
+}
+
+bool Engine::load_resume_data_locked(const TaskSnapshot& task, lt::add_torrent_params& add) {
+    const auto path = state_path_ / "resume" / (task.id + ".fastresume");
+    if (!std::filesystem::exists(path)) return false;
+    try {
+        const auto size = std::filesystem::file_size(path);
+        if (size == 0 || size > max_resume_file_bytes) throw std::runtime_error("resume data size is invalid");
+        std::ifstream input(path, std::ios::binary);
+        if (!input) throw std::runtime_error("cannot open resume data");
+        std::vector<char> bytes(static_cast<std::size_t>(size));
+        input.read(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+        if (!input) throw std::runtime_error("cannot read resume data");
+        lt::error_code error;
+        auto restored = lt::read_resume_data(lt::span<char const>(bytes.data(), bytes.size()), error);
+        if (error) throw std::runtime_error(error.message());
+        const auto restored_hash = hash_string(restored.info_hashes);
+        if (!task.info_hash.empty() && restored_hash != task.info_hash) {
+            throw std::runtime_error("resume data info-hash does not match the task catalog");
+        }
+        if (restored.ti) {
+            for (lt::file_index_t index{0}; index < restored.ti->files().end_file(); ++index) {
+                if (!is_safe_relative_torrent_path(path_from_utf8(restored.ti->files().file_path(index)))) {
+                    throw std::runtime_error("resume data contains an unsafe torrent path");
+                }
+            }
+        }
+        add = std::move(restored);
+        return true;
+    } catch (const std::exception&) {
+        const auto suffix = std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+        auto quarantined = path;
+        quarantined += ".corrupt." + suffix;
+        std::error_code error;
+        std::filesystem::rename(path, quarantined, error);
+        return false;
+    }
+}
+
+void Engine::write_resume_data_locked(const std::string& id, const lt::add_torrent_params& add) {
+    const auto directory = state_path_ / "resume";
+    std::error_code error;
+    std::filesystem::create_directories(directory, error);
+    if (error) throw std::runtime_error("cannot create resume directory: " + error.message());
+    const auto bytes = lt::write_resume_data_buf(add);
+    const auto target = directory / (id + ".fastresume");
+    const auto temporary = directory / (id + ".fastresume.tmp");
+    {
+        std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+        if (!output) throw std::runtime_error("cannot write resume data");
+        output.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+        output.flush();
+        if (!output) throw std::runtime_error("cannot flush resume data");
+    }
+    if (!replace_file(temporary, target)) throw std::runtime_error("cannot atomically replace resume data");
 }
 
 TaskSnapshot& Engine::require_task_locked(const std::string& id) {
@@ -501,6 +676,7 @@ bool Engine::update_snapshots_locked() {
             || previous_download_rate != task.download_rate || previous_upload_rate != task.upload_rate
             || previous_peers != task.peers || previous_seeds != task.seeds;
         if (state_changed || progress_changed) emit_task("event.taskUpdated", task);
+        if (state_changed) request_resume_save_locked(id, false);
         catalog_changed = catalog_changed || state_changed;
     }
     return catalog_changed;
@@ -512,7 +688,11 @@ void Engine::worker_loop(std::stop_token stop_token) {
         if (stop_token.stop_requested()) break;
         try {
             std::scoped_lock lock(mutex_);
-            if (initialized_ && session_ && update_snapshots_locked()) persist_catalog_locked();
+            if (initialized_ && session_) {
+                process_alerts_locked();
+                request_periodic_resume_saves_locked();
+                if (update_snapshots_locked()) persist_catalog_locked();
+            }
         } catch (...) {
             // Request handlers surface persistent failures. The monitor must never terminate the process.
         }

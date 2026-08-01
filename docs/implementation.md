@@ -30,7 +30,7 @@
 - [x] Windows 原子替换 catalog；
 - [x] 单条损坏任务隔离，损坏 catalog 隔离为 `.corrupt`；
 - [x] EOF、显式 shutdown 和异常析构路径停止监控线程并保存；
-- [ ] libtorrent fast-resume 数据的定期保存、最终保存和加载；
+- [x] libtorrent fast-resume 数据的关键状态/30 秒周期保存、最终保存和恢复加载，损坏文件按任务隔离；
 - [ ] Magnet 元数据取得后的路径/空间二次检查与明确的元数据超时；
 - [ ] libtorrent alert 到业务错误码的细粒度映射；
 - [ ] Windows Job Object 父子进程监管（由 BangumiToday 启动端配合）。
@@ -44,4 +44,4 @@
 - [ ] Flutter Release、侧载/升级 MSIX 和 Microsoft Store 包验证；
 - [ ] BangumiToday `BtEngineClient`、任务 Store 和 UI 接入。
 
-下一阶段应先完成 fast-resume 与本地 Seeder 集成测试，再开始 Flutter/MSIX 接入；这样可在 UI 改造前验证下载、校验和崩溃恢复闭环。
+下一阶段应先完成本地 Tracker/Seeder 集成测试，再开始 Flutter/MSIX 接入；这样可在 UI 改造前验证下载、校验和崩溃恢复闭环。
