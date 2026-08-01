@@ -14,6 +14,8 @@
 
 完整需求和分阶段里程碑见 [docs/requirements.md](docs/requirements.md)，当前实现边界见 [docs/implementation.md](docs/implementation.md)，调用契约见 [docs/protocol.md](docs/protocol.md)。
 
+参与开发前请阅读 [贡献指南](CONTRIBUTING.md)。所有提交均采用 Gitmoji 格式。
+
 ## 构建
 
 需要 Visual Studio（Desktop development with C++）、CMake、Ninja 和 vcpkg。依赖由 `vcpkg.json` 固定。
