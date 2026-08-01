@@ -4,7 +4,6 @@
 #include <iostream>
 
 int main() {
-    std::ios::sync_with_stdio(false);
     bt::ProtocolServer* protocol = nullptr;
     bt::Engine engine([&protocol](const std::string& method, const nlohmann::json& params) {
         if (protocol != nullptr) protocol->send_event(method, params);

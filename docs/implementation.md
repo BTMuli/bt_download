@@ -41,8 +41,8 @@
 - [x] 强制终止、断点恢复和安全删除 E2E；
 - [x] 磁盘不足与私有种子 E2E；
 - [x] CPU、工作集、磁盘吞吐和事件频率基准；
-- [ ] Release 依赖复制、第三方许可证/SBOM；
+- [x] Release 依赖复制、第三方许可证/SBOM；
 - [ ] Flutter Release、侧载/升级 MSIX 和 Microsoft Store 包验证；
 - [ ] BangumiToday `BtEngineClient`、任务 Store 和 UI 接入。
 
-下一阶段应补齐 Release 依赖复制、第三方许可证和 SBOM，再开始 Flutter/MSIX 接入；这样可先保证伴随进程及其原生依赖能形成可审计、可复制的发布产物。
+下一阶段应把完整 Release 安装目录接入 Flutter/MSIX 构建，并验证侧载、升级安装和 Store 包环境下的进程启动与状态恢复。

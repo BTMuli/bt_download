@@ -29,6 +29,8 @@ ctest --preset windows-x64-debug
 
 产物位于 `out/build/windows-x64-debug/bt_download.exe`。stdout 只输出协议帧；诊断日志只写 stderr。
 
+Windows Release 分发应使用 `cmake --install out/build/windows-x64-release` 生成的完整目录，不能单独复制可执行文件。依赖 DLL、许可证与 SPDX SBOM 的生成和接入约束见 [docs/release.md](docs/release.md)。
+
 ## 性能基准
 
 Windows Release 发布前应运行独立进程资源基准，采集空闲 CPU/工作集、双任务磁盘吞吐、请求延迟和进度事件频率，并保存 JSON 结果。完整命令、快速回归模式和指标口径见 [docs/performance.md](docs/performance.md)。

@@ -123,6 +123,13 @@ lt::settings_pack make_settings(const nlohmann::json& config) {
     return settings;
 }
 
+void apply_local_rate_limits(lt::session& session, const nlohmann::json& config) {
+    auto local = session.get_peer_class(lt::session::local_peer_class_id);
+    local.download_limit = config.value("downloadRateLimit", 0);
+    local.upload_limit = config.value("uploadRateLimit", 1024 * 1024);
+    session.set_peer_class(lt::session::local_peer_class_id, local);
+}
+
 } // namespace
 
 Engine::Engine(EventSink event_sink)
@@ -182,6 +189,7 @@ nlohmann::json Engine::initialize(const nlohmann::json& params) {
     if (params.contains("config")) config_.update(params["config"]);
     validate_config(config_);
     session_ = std::make_unique<lt::session>(make_settings(config_));
+    apply_local_rate_limits(*session_, config_);
     initialized_ = true;
     load_catalog_locked();
     next_resume_save_ = std::chrono::steady_clock::now() + resume_save_interval;
@@ -211,6 +219,7 @@ nlohmann::json Engine::configure(const nlohmann::json& params) {
     validate_config(next);
     config_ = std::move(next);
     session_->apply_settings(make_settings(config_));
+    apply_local_rate_limits(*session_, config_);
     persist_catalog_locked();
     return {{"config", config_}};
 }

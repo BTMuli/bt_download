@@ -1,14 +1,24 @@
 cmake_minimum_required(VERSION 3.25)
 
-project(bt_download VERSION 0.1.0 LANGUAGES CXX)
-
 if(POLICY CMP0167)
     cmake_policy(SET CMP0167 NEW)
     set(CMAKE_POLICY_DEFAULT_CMP0167 NEW)
 endif()
+if(POLICY CMP0207)
+    cmake_policy(SET CMP0207 NEW)
+endif()
+
+project(bt_download VERSION 0.1.0 LANGUAGES CXX)
 
 option(BT_DOWNLOAD_BUILD_TESTS "Build bt_download tests" ON)
 option(BT_DOWNLOAD_BUILD_BENCHMARKS "Build bt_download performance benchmarks" ON)
+
+# Full automatic inlining under MSVC 19.51 makes several libtorrent/nlohmann-
+# heavy translation units terminate with FAST_FAIL_STACK_COOKIE_CHECK_FAILURE.
+# Retain /O2 while limiting inlining for this toolset generation.
+if(MSVC AND MSVC_VERSION EQUAL 1951)
+    add_compile_options("$<$<CONFIG:Release>:/Ob1>")
+endif()
 
 find_package(LibtorrentRasterbar CONFIG REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
@@ -40,7 +50,39 @@ endif()
 add_executable(bt_download src/main.cpp)
 target_link_libraries(bt_download PRIVATE bt_download_core)
 
-install(TARGETS bt_download RUNTIME DESTINATION .)
+if(WIN32)
+    install(TARGETS bt_download
+        RUNTIME_DEPENDENCIES
+            DIRECTORIES "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/bin"
+            PRE_EXCLUDE_REGEXES
+                "api-ms-.*"
+                "ext-ms-.*"
+            POST_EXCLUDE_REGEXES
+                ".*[\\\\/][Ss][Yy][Ss][Tt][Ee][Mm]32[\\\\/].*"
+                ".*[\\\\/][Ss][Yy][Ss][Ww][Oo][Ww]64[\\\\/].*"
+        RUNTIME DESTINATION .
+    )
+else()
+    install(TARGETS bt_download RUNTIME DESTINATION .)
+endif()
+
+if(MSVC)
+    set(CMAKE_INSTALL_SYSTEM_RUNTIME_DESTINATION .)
+    set(CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS_SKIP TRUE)
+    include(InstallRequiredSystemLibraries)
+    install(PROGRAMS ${CMAKE_INSTALL_SYSTEM_RUNTIME_LIBS} DESTINATION .)
+endif()
+
+if(WIN32 AND MSVC AND DEFINED VCPKG_INSTALLED_DIR AND DEFINED VCPKG_TARGET_TRIPLET)
+    configure_file(
+        cmake/InstallReleaseMetadata.cmake.in
+        "${CMAKE_CURRENT_BINARY_DIR}/InstallReleaseMetadata.cmake"
+        @ONLY
+    )
+    install(SCRIPT "${CMAKE_CURRENT_BINARY_DIR}/InstallReleaseMetadata.cmake")
+elseif(WIN32)
+    message(WARNING "vcpkg paths are unavailable; release license and SBOM generation is disabled")
+endif()
 
 if(BT_DOWNLOAD_BUILD_BENCHMARKS AND WIN32)
     add_executable(bt_download_performance_benchmark
@@ -74,6 +116,13 @@ if(BT_DOWNLOAD_BUILD_TESTS)
     )
     target_link_libraries(bt_download_tests PRIVATE bt_download_core)
     add_test(NAME bt_download_tests COMMAND bt_download_tests)
+
+    add_test(NAME bt_download_process_smoke_test
+        COMMAND ${CMAKE_COMMAND}
+            "-DENGINE_PATH=$<TARGET_FILE:bt_download>"
+            "-DSTATE_PATH=${CMAKE_CURRENT_BINARY_DIR}/process-smoke-state"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/process_smoke_test.cmake"
+    )
 
     add_executable(bt_download_integration_tests
         tests/download_integration_test.cpp
