@@ -31,7 +31,7 @@
 - [x] 单条损坏任务隔离，损坏 catalog 隔离为 `.corrupt`；
 - [x] EOF、显式 shutdown 和异常析构路径停止监控线程并保存；
 - [x] libtorrent fast-resume 数据的关键状态/30 秒周期保存、最终保存和恢复加载，损坏文件按任务隔离；
-- [ ] Magnet 元数据取得后的路径/空间二次检查与明确的元数据超时；
+- [x] Magnet 元数据取得后的路径/空间二次检查与明确的元数据超时；
 - [ ] libtorrent alert 到业务错误码的细粒度映射；
 - [ ] Windows Job Object 父子进程监管（由 BangumiToday 启动端配合）。
 

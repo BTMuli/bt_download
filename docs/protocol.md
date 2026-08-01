@@ -32,7 +32,7 @@
 {"kind":"magnet","uri":"magnet:?xt=urn:btih:..."}
 ```
 
-配置字段以字节/秒和计数为单位：`activeDownloads`、`downloadRateLimit`、`uploadRateLimit`、`connectionsLimit`、`connectionsPerTask`。速率 `0` 表示不限速。
+配置字段以字节/秒、秒和计数为单位：`activeDownloads`、`downloadRateLimit`、`uploadRateLimit`、`connectionsLimit`、`connectionsPerTask`、`metadataTimeoutSeconds`。速率 `0` 表示不限速；Magnet 元数据超时默认 300 秒，取值范围为 1 至 86400 秒。
 
 ## 错误
 
@@ -42,7 +42,7 @@ JSON-RPC `error.data` 至少包含稳定的业务 `code` 与 `retryable`。调�
 {"jsonrpc":"2.0","id":"2","error":{"code":-32011,"message":"the torrent already exists at this save path","data":{"code":"DUPLICATE_TASK","retryable":false,"taskId":"..."}}}
 ```
 
-常用业务码包括 `NOT_INITIALIZED`、`PROTOCOL_MISMATCH`、`SOURCE_INVALID`、`SOURCE_UNSUPPORTED`、`UNSAFE_TORRENT_PATH`、`SAVE_PATH_INVALID`、`SAVE_PATH_UNAVAILABLE`、`SAVE_PATH_NOT_WRITABLE`、`DISK_FULL`、`DUPLICATE_TASK`、`TASK_NOT_FOUND`、`TASK_UNAVAILABLE`、`PERSISTENCE_ERROR` 和 `INTERNAL_ERROR`。
+常用业务码包括 `NOT_INITIALIZED`、`PROTOCOL_MISMATCH`、`SOURCE_INVALID`、`SOURCE_UNSUPPORTED`、`UNSAFE_TORRENT_PATH`、`METADATA_TIMEOUT`、`SAVE_PATH_INVALID`、`SAVE_PATH_UNAVAILABLE`、`SAVE_PATH_NOT_WRITABLE`、`DISK_FULL`、`DUPLICATE_TASK`、`TASK_NOT_FOUND`、`TASK_UNAVAILABLE`、`PERSISTENCE_ERROR` 和 `INTERNAL_ERROR`。
 
 ## 事件
 

@@ -14,6 +14,7 @@
 
 #include <libtorrent/add_torrent_params.hpp>
 #include <libtorrent/alert_types.hpp>
+#include <libtorrent/download_priority.hpp>
 #include <libtorrent/error_code.hpp>
 #include <libtorrent/magnet_uri.hpp>
 #include <libtorrent/read_resume_data.hpp>
@@ -94,11 +95,15 @@ void validate_config(const nlohmann::json& config) {
     const int per_task = config.value("connectionsPerTask", 80);
     const std::int64_t download_limit = config.value("downloadRateLimit", std::int64_t{0});
     const std::int64_t upload_limit = config.value("uploadRateLimit", std::int64_t{1024 * 1024});
+    const int metadata_timeout = config.value("metadataTimeoutSeconds", 300);
     if (active < 1 || active > 64) fail(-32602, "INVALID_CONFIG", "activeDownloads must be between 1 and 64");
     if (connections < 1 || connections > 10000 || per_task < 1 || per_task > connections) {
         fail(-32602, "INVALID_CONFIG", "connection limits are invalid");
     }
     if (download_limit < 0 || upload_limit < 0) fail(-32602, "INVALID_CONFIG", "rate limits cannot be negative");
+    if (metadata_timeout < 1 || metadata_timeout > 86400) {
+        fail(-32602, "INVALID_CONFIG", "metadataTimeoutSeconds must be between 1 and 86400");
+    }
 }
 
 lt::settings_pack make_settings(const nlohmann::json& config) {
@@ -123,7 +128,7 @@ lt::settings_pack make_settings(const nlohmann::json& config) {
 Engine::Engine(EventSink event_sink)
     : event_sink_(std::move(event_sink)),
       config_({{"activeDownloads", 2}, {"downloadRateLimit", 0}, {"uploadRateLimit", 1024 * 1024},
-               {"connectionsLimit", 200}, {"connectionsPerTask", 80}}),
+               {"connectionsLimit", 200}, {"connectionsPerTask", 80}, {"metadataTimeoutSeconds", 300}}),
       started_at_(std::chrono::steady_clock::now()),
       next_resume_save_(started_at_ + resume_save_interval) {}
 
@@ -255,6 +260,8 @@ nlohmann::json Engine::add_task(const nlohmann::json& params) {
             fail(-32010, "SOURCE_INVALID", "invalid magnet URI");
         }
         info_hash = hash_string(add.info_hashes);
+        // Metadata must be validated before any payload file becomes eligible for download.
+        add.flags |= lt::torrent_flags::default_dont_download;
     }
     add.save_path = path_utf8(save_validation.normalized);
     add.max_connections = config_.value("connectionsPerTask", 80);
@@ -272,7 +279,7 @@ nlohmann::json Engine::add_task(const nlohmann::json& params) {
     if (error) fail(-32000, "ENGINE_ADD_FAILED", error.message(), true);
     TaskSnapshot task;
     task.id = new_task_id();
-    task.state = kind == "magnet" ? TaskState::metadata : (start ? TaskState::queued : TaskState::paused);
+    task.state = kind == "magnet" && start ? TaskState::metadata : (start ? TaskState::queued : TaskState::paused);
     task.source_kind = kind;
     task.source = source;
     task.save_path = save_validation.normalized;
@@ -281,6 +288,7 @@ nlohmann::json Engine::add_task(const nlohmann::json& params) {
     task.private_torrent = private_torrent;
     handles_.emplace(task.id, handle);
     tasks_.emplace(task.id, task);
+    if (kind == "magnet" && start) metadata_started_.emplace(task.id, std::chrono::steady_clock::now());
     persist_catalog_locked();
     emit_task("event.taskAdded", task);
     return {{"task", task}};
@@ -311,6 +319,7 @@ nlohmann::json Engine::pause_task(const nlohmann::json& params) {
         if (handle == handles_.end()) fail(-32005, "TASK_UNAVAILABLE", "task has no active torrent handle", true);
         handle->second.pause();
         task.state = TaskState::paused;
+        metadata_started_.erase(task.id);
         request_resume_save_locked(task.id, false);
         persist_catalog_locked();
         emit_task("event.taskUpdated", task);
@@ -325,9 +334,20 @@ nlohmann::json Engine::resume_task(const nlohmann::json& params) {
     if (task.state == TaskState::paused || task.state == TaskState::error) {
         const auto handle = handles_.find(task.id);
         if (handle == handles_.end()) fail(-32005, "TASK_UNAVAILABLE", "task has no active torrent handle", true);
-        handle->second.resume();
-        task.state = task.info_hash.empty() ? TaskState::metadata : TaskState::queued;
         task.last_error.reset();
+        if (task.source_kind == "magnet") {
+            if (const auto info = handle->second.torrent_file()) {
+                if (!validate_magnet_metadata_locked(task.id, handle->second, info)) return {{"task", task}};
+                task.state = TaskState::queued;
+            } else {
+                handle->second.set_flags(lt::torrent_flags::default_dont_download);
+                task.state = TaskState::metadata;
+                metadata_started_.insert_or_assign(task.id, std::chrono::steady_clock::now());
+            }
+        } else {
+            task.state = TaskState::queued;
+        }
+        handle->second.resume();
         request_resume_save_locked(task.id, false);
         persist_catalog_locked();
         emit_task("event.taskUpdated", task);
@@ -368,6 +388,7 @@ nlohmann::json Engine::remove_task(const nlohmann::json& params) {
     handles_.erase(id);
     pending_resume_saves_.erase(id);
     deferred_resume_saves_.erase(id);
+    metadata_started_.erase(id);
     tasks_.erase(id);
     std::error_code resume_error;
     std::filesystem::remove(state_path_ / "resume" / (id + ".fastresume"), resume_error);
@@ -404,6 +425,7 @@ void Engine::finalize_locked() {
     persist_catalog_locked();
     pending_resume_saves_.clear();
     deferred_resume_saves_.clear();
+    metadata_started_.clear();
     handles_.clear();
     session_.reset();
 }
@@ -465,7 +487,18 @@ void Engine::load_catalog_locked() {
                 if (error) throw std::runtime_error(error.message());
                 add.save_path = path_utf8(task.save_path);
                 add.max_connections = config_.value("connectionsPerTask", 80);
-                if (task.state == TaskState::paused || task.state == TaskState::completed) {
+                const bool stage_magnet_metadata = task.source_kind == "magnet"
+                    && task.state != TaskState::paused && task.state != TaskState::completed
+                    && task.state != TaskState::error;
+                if (stage_magnet_metadata) {
+                    add.flags |= lt::torrent_flags::default_dont_download;
+                    if (add.ti) {
+                        add.file_priorities.assign(static_cast<std::size_t>(add.ti->num_files()), lt::dont_download);
+                    }
+                } else if (task.source_kind == "magnet" && !add.ti) {
+                    add.flags |= lt::torrent_flags::default_dont_download;
+                }
+                if (task.state == TaskState::paused || task.state == TaskState::completed || task.state == TaskState::error) {
                     add.flags |= lt::torrent_flags::paused;
                 } else {
                     add.flags &= ~lt::torrent_flags::paused;
@@ -473,6 +506,9 @@ void Engine::load_catalog_locked() {
                 auto handle = session_->add_torrent(std::move(add), error);
                 if (error) throw std::runtime_error(error.message());
                 handles_.emplace(task.id, handle);
+                if (stage_magnet_metadata) {
+                    metadata_started_.insert_or_assign(task.id, std::chrono::steady_clock::now());
+                }
                 tasks_.emplace(task.id, std::move(task));
             } catch (const std::exception& exception) {
                 TaskSnapshot damaged;
@@ -573,6 +609,65 @@ void Engine::save_final_resume_data_locked() {
     }
 }
 
+void Engine::fail_task_locked(const std::string& id, std::string code, std::string message, bool retryable) {
+    const auto handle = handles_.find(id);
+    if (handle != handles_.end()) handle->second.pause();
+    auto& task = tasks_.at(id);
+    task.state = TaskState::error;
+    task.download_rate = 0;
+    task.upload_rate = 0;
+    task.last_error = TaskError{std::move(code), std::move(message), retryable};
+    metadata_started_.erase(id);
+    request_resume_save_locked(id, false);
+    persist_catalog_locked();
+    emit_task("event.taskUpdated", task);
+}
+
+bool Engine::validate_magnet_metadata_locked(const std::string& id,
+    const lt::torrent_handle& handle, const std::shared_ptr<const lt::torrent_info>& info) {
+    auto& task = tasks_.at(id);
+    for (lt::file_index_t index{0}; index < info->files().end_file(); ++index) {
+        if (!is_safe_relative_torrent_path(path_from_utf8(info->files().file_path(index)))) {
+            fail_task_locked(id, "UNSAFE_TORRENT_PATH", "torrent contains an unsafe file path", false);
+            return false;
+        }
+    }
+
+    const auto save_validation = validate_save_path(task.save_path);
+    if (!save_validation.valid) {
+        fail_task_locked(id, save_validation.error_code, save_validation.message,
+            save_validation.error_code != "SAVE_PATH_INVALID");
+        return false;
+    }
+
+    std::error_code error;
+    const auto space = std::filesystem::space(save_validation.normalized, error);
+    if (error) {
+        fail_task_locked(id, "SAVE_PATH_UNAVAILABLE", "cannot query savePath free space: " + error.message(), true);
+        return false;
+    }
+    const auto required = static_cast<std::uint64_t>(std::max<std::int64_t>(0, info->total_size()));
+    if (required > space.available) {
+        fail_task_locked(id, "DISK_FULL",
+            "not enough free space for torrent payload (required " + std::to_string(required)
+                + " bytes, available " + std::to_string(space.available) + " bytes)",
+            true);
+        return false;
+    }
+
+    std::vector<lt::download_priority_t> priorities(
+        static_cast<std::size_t>(info->num_files()), lt::default_priority);
+    handle.prioritize_files(priorities);
+    handle.unset_flags(lt::torrent_flags::default_dont_download);
+    task.save_path = save_validation.normalized;
+    task.total_bytes = required;
+    task.private_torrent = info->priv();
+    if (task.display_name.empty()) task.display_name = info->name();
+    task.last_error.reset();
+    metadata_started_.erase(id);
+    return true;
+}
+
 bool Engine::load_resume_data_locked(const TaskSnapshot& task, lt::add_torrent_params& add) {
     const auto path = state_path_ / "resume" / (task.id + ".fastresume");
     if (!std::filesystem::exists(path)) return false;
@@ -643,6 +738,26 @@ bool Engine::update_snapshots_locked() {
     bool catalog_changed = false;
     for (auto& [id, handle] : handles_) {
         auto& task = tasks_.at(id);
+        if (task.source_kind == "magnet" && metadata_started_.contains(id)) {
+            if (const auto info = handle.torrent_file()) {
+                if (!validate_magnet_metadata_locked(id, handle, info)) {
+                    catalog_changed = true;
+                    continue;
+                }
+                task.state = TaskState::queued;
+                request_resume_save_locked(id, false);
+                persist_catalog_locked();
+                emit_task("event.taskUpdated", task);
+                catalog_changed = true;
+                continue;
+            }
+            const auto timeout = std::chrono::seconds(config_.value("metadataTimeoutSeconds", 300));
+            if (std::chrono::steady_clock::now() - metadata_started_.at(id) >= timeout) {
+                fail_task_locked(id, "METADATA_TIMEOUT", "timed out while fetching magnet metadata", true);
+                catalog_changed = true;
+                continue;
+            }
+        }
         const auto status = handle.status(lt::torrent_handle::query_name);
         const auto previous_state = task.state;
         const auto previous_downloaded = task.downloaded_bytes;
@@ -651,6 +766,7 @@ bool Engine::update_snapshots_locked() {
         const auto previous_peers = task.peers;
         const auto previous_seeds = task.seeds;
         auto next_state = state_from_status(status);
+        if (task.state == TaskState::error) next_state = TaskState::error;
         if (status.errc) {
             next_state = TaskState::error;
             task.last_error = TaskError{"TORRENT_ERROR", status.errc.message(), true};

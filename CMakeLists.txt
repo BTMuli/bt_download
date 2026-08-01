@@ -45,6 +45,7 @@ if(BT_DOWNLOAD_BUILD_TESTS)
     enable_testing()
     add_executable(bt_download_tests
         tests/test_main.cpp
+        tests/magnet_metadata_test.cpp
         tests/path_safety_test.cpp
         tests/protocol_test.cpp
         tests/resume_data_test.cpp
