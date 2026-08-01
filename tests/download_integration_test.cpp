@@ -1,4 +1,5 @@
 #include "bt_download/engine.hpp"
+#include "bt_download/protocol.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -7,6 +8,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -277,12 +279,14 @@ std::vector<char> read_bytes(const std::filesystem::path& path) {
 std::shared_ptr<lt::torrent_info> create_torrent_file(
     const std::filesystem::path& payload,
     const std::filesystem::path& torrent_path,
-    const std::string& announce_url) {
+    const std::string& announce_url,
+    bool private_torrent = false) {
     lt::file_storage storage;
     lt::add_files(storage, path_utf8(payload));
     lt::create_torrent torrent(storage, 16 * 1024, lt::create_torrent::v1_only);
     torrent.add_tracker(announce_url);
     torrent.set_creator("bt_download integration test");
+    torrent.set_priv(private_torrent);
     lt::error_code error;
     lt::set_piece_hashes(torrent, path_utf8(payload.parent_path()), error);
     expect(!error, "cannot hash integration torrent: " + error.message());
@@ -297,6 +301,48 @@ std::shared_ptr<lt::torrent_info> create_torrent_file(
     auto info = std::make_shared<lt::torrent_info>(path_utf8(torrent_path), error);
     expect(!error, "cannot reopen integration torrent: " + error.message());
     return info;
+}
+
+std::uint64_t create_oversized_torrent_file(const std::filesystem::path& torrent_path,
+    const std::filesystem::path& save_path) {
+    std::error_code error;
+    const auto space = std::filesystem::space(save_path, error);
+    expect(!error, "cannot query integration test free space: " + error.message());
+    constexpr std::uint64_t headroom = 1024ULL * 1024ULL * 1024ULL;
+    expect(space.available <= static_cast<std::uint64_t>((std::numeric_limits<std::int64_t>::max)()) - headroom,
+        "integration test volume reports an unsupported amount of free space");
+    const auto required = static_cast<std::int64_t>(space.available + headroom);
+
+    lt::file_storage storage;
+    storage.add_file("disk-full.bin", required);
+    lt::create_torrent torrent(storage, 4 * 1024 * 1024, lt::create_torrent::v1_only);
+    const auto placeholder_hash = (lt::sha1_hash::max)();
+    for (int index = 0; index < torrent.num_pieces(); ++index) {
+        torrent.set_hash(lt::piece_index_t{index}, placeholder_hash);
+    }
+    torrent.set_creator("bt_download disk-full integration test");
+
+    const auto bytes = torrent.generate_buf();
+    std::ofstream output(torrent_path, std::ios::binary | std::ios::trunc);
+    output.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    output.close();
+    expect(static_cast<bool>(output), "cannot flush oversized integration torrent");
+    return static_cast<std::uint64_t>(required);
+}
+
+nlohmann::json dispatch_rpc(bt::Engine& engine, const std::string& method,
+    const nlohmann::json& params) {
+    std::istringstream input(nlohmann::json({
+        {"jsonrpc", "2.0"}, {"id", 1}, {"method", method}, {"params", params},
+    }).dump() + "\n");
+    std::ostringstream output;
+    std::ostringstream log;
+    bt::ProtocolServer server(input, output, log,
+        [&engine](const std::string& request_method, const nlohmann::json& request_params) {
+            return engine.dispatch(request_method, request_params);
+        });
+    expect(server.run() == 0, "integration JSON-RPC request failed to run");
+    return nlohmann::json::parse(output.str());
 }
 
 std::string magnet_uri(const lt::torrent_info& info, const LocalHttpTracker& tracker) {
@@ -500,20 +546,25 @@ void run_download_integration_test() {
     const auto single_source = seed_root / "single.bin";
     const auto bundle_source = seed_root / "bundle";
     const auto magnet_source = seed_root / "magnet.bin";
+    const auto private_source = seed_root / "private.bin";
     const auto recovery_source = seed_root / "recovery.bin";
     write_payload(single_source, 180 * 1024 + 73, 11);
     write_payload(bundle_source / "first.bin", 96 * 1024 + 19, 23);
     write_payload(bundle_source / "nested" / "second.bin", 144 * 1024 + 41, 31);
     write_payload(magnet_source, 192 * 1024 + 29, 47);
+    write_payload(private_source, 224 * 1024 + 61, 53);
     write_payload(recovery_source, 4 * 1024 * 1024 + 113, 59);
 
     const auto single_torrent_path = temporary.path() / "single.torrent";
     const auto bundle_torrent_path = temporary.path() / "bundle.torrent";
     const auto magnet_torrent_path = temporary.path() / "magnet.torrent";
+    const auto private_torrent_path = temporary.path() / "private.torrent";
     const auto recovery_torrent_path = temporary.path() / "recovery.torrent";
     const auto single_info = create_torrent_file(single_source, single_torrent_path, tracker.announce_url());
     const auto bundle_info = create_torrent_file(bundle_source, bundle_torrent_path, tracker.announce_url());
     const auto magnet_info = create_torrent_file(magnet_source, magnet_torrent_path, tracker.announce_url());
+    const auto private_info = create_torrent_file(
+        private_source, private_torrent_path, tracker.announce_url(), true);
     const auto recovery_info = create_torrent_file(recovery_source, recovery_torrent_path, tracker.announce_url());
 
     lt::settings_pack seed_settings;
@@ -528,10 +579,12 @@ void run_download_integration_test() {
     const auto single_seed = add_seed(seeder, single_info, seed_root);
     const auto bundle_seed = add_seed(seeder, bundle_info, seed_root);
     const auto magnet_seed = add_seed(seeder, magnet_info, seed_root);
+    const auto private_seed = add_seed(seeder, private_info, seed_root);
     const auto recovery_seed = add_seed(seeder, recovery_info, seed_root);
-    expect(single_seed.is_valid() && bundle_seed.is_valid() && magnet_seed.is_valid() && recovery_seed.is_valid(),
+    expect(single_seed.is_valid() && bundle_seed.is_valid() && magnet_seed.is_valid()
+            && private_seed.is_valid() && recovery_seed.is_valid(),
         "local seeder handle is invalid");
-    wait_for_seeds({single_seed, bundle_seed, magnet_seed, recovery_seed});
+    wait_for_seeds({single_seed, bundle_seed, magnet_seed, private_seed, recovery_seed});
     bt::Engine engine([](const std::string&, const nlohmann::json&) {});
     engine.dispatch("engine.initialize", {
         {"protocolVersion", "1.0"},
@@ -542,9 +595,13 @@ void run_download_integration_test() {
     const auto single_download = temporary.path() / "single-download";
     const auto bundle_download = temporary.path() / "bundle-download";
     const auto magnet_download = temporary.path() / "magnet-download";
+    const auto private_download = temporary.path() / "private-download";
+    const auto disk_full_download = temporary.path() / "disk-full-download";
     std::filesystem::create_directories(single_download);
     std::filesystem::create_directories(bundle_download);
     std::filesystem::create_directories(magnet_download);
+    std::filesystem::create_directories(private_download);
+    std::filesystem::create_directories(disk_full_download);
 
     const auto single_id = add_torrent_task(engine, single_torrent_path, single_download);
     const auto single_task = wait_for_completion(engine, single_id, tracker, single_seed);
@@ -589,6 +646,30 @@ void run_download_integration_test() {
         "magnet task did not report complete byte counts");
     expect(read_bytes(magnet_source) == read_bytes(magnet_download / "magnet.bin"),
         "magnet payload differs from seed");
+
+    const auto private_id = add_torrent_task(engine, private_torrent_path, private_download);
+    const auto private_task = wait_for_completion(engine, private_id, tracker, private_seed);
+    expect(private_task.at("private") == true, "private torrent flag was not exposed in the task snapshot");
+    expect(read_bytes(private_source) == read_bytes(private_download / "private.bin"),
+        "private torrent payload differs from seed");
+
+    const auto disk_full_torrent_path = temporary.path() / "disk-full.torrent";
+    const auto required_bytes = create_oversized_torrent_file(disk_full_torrent_path, disk_full_download);
+    const auto disk_full_response = dispatch_rpc(engine, "task.add", {
+        {"source", {{"kind", "torrentFile"}, {"path", path_utf8(disk_full_torrent_path)}}},
+        {"savePath", path_utf8(disk_full_download)},
+        {"start", true},
+    });
+    expect(disk_full_response.at("error").at("code") == -32012,
+        "disk-full preflight returned the wrong JSON-RPC code");
+    const auto& disk_full_data = disk_full_response.at("error").at("data");
+    expect(disk_full_data.at("code") == "DISK_FULL", "disk-full preflight returned the wrong business code");
+    expect(disk_full_data.at("retryable") == true, "disk-full preflight must be retryable");
+    expect(disk_full_data.at("requiredBytes").get<std::uint64_t>() == required_bytes,
+        "disk-full preflight reported the wrong required byte count");
+    expect(disk_full_data.at("requiredBytes").get<std::uint64_t>()
+            > disk_full_data.at("availableBytes").get<std::uint64_t>(),
+        "disk-full preflight did not report a real capacity deficit");
 
     engine.dispatch("engine.shutdown", nlohmann::json::object());
 
