@@ -62,7 +62,7 @@ private:
     std::optional<std::string> task_id_for_handle_locked(const libtorrent::torrent_handle& handle) const;
     TaskSnapshot& require_task_locked(const std::string& id);
     void emit_task(const std::string& event, const TaskSnapshot& task);
-    bool update_snapshots_locked();
+    bool update_snapshots_locked(bool emit_events);
     void worker_loop(std::stop_token stop_token);
     std::string new_task_id() const;
 
@@ -73,6 +73,7 @@ private:
     std::unordered_map<std::string, libtorrent::torrent_handle> handles_;
     std::unordered_set<std::string> pending_resume_saves_;
     std::unordered_set<std::string> deferred_resume_saves_;
+    std::unordered_set<std::string> pending_task_updates_;
     std::unordered_map<std::string, std::chrono::steady_clock::time_point> metadata_started_;
     std::filesystem::path state_path_;
     nlohmann::json config_;

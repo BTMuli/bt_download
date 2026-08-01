@@ -303,7 +303,7 @@ nlohmann::json Engine::add_task(const nlohmann::json& params) {
 nlohmann::json Engine::list_tasks() {
     std::scoped_lock lock(mutex_);
     require_initialized();
-    update_snapshots_locked();
+    if (update_snapshots_locked(false)) persist_catalog_locked();
     nlohmann::json result = nlohmann::json::array();
     for (const auto& [id, task] : tasks_) { (void)id; result.push_back(task); }
     return {{"tasks", std::move(result)}, {"sequence", sequence_}};
@@ -312,7 +312,7 @@ nlohmann::json Engine::list_tasks() {
 nlohmann::json Engine::get_task(const nlohmann::json& params) {
     std::scoped_lock lock(mutex_);
     require_initialized();
-    update_snapshots_locked();
+    if (update_snapshots_locked(false)) persist_catalog_locked();
     return {{"task", require_task_locked(params.at("id").get<std::string>())}, {"sequence", sequence_}};
 }
 
@@ -395,6 +395,7 @@ nlohmann::json Engine::remove_task(const nlohmann::json& params) {
     handles_.erase(id);
     pending_resume_saves_.erase(id);
     deferred_resume_saves_.erase(id);
+    pending_task_updates_.erase(id);
     metadata_started_.erase(id);
     tasks_.erase(id);
     std::error_code resume_error;
@@ -736,10 +737,11 @@ TaskSnapshot& Engine::require_task_locked(const std::string& id) {
 }
 
 void Engine::emit_task(const std::string& event, const TaskSnapshot& task) {
+    pending_task_updates_.erase(task.id);
     event_sink_(event, {{"sequence", ++sequence_}, {"task", task}});
 }
 
-bool Engine::update_snapshots_locked() {
+bool Engine::update_snapshots_locked(bool emit_events) {
     bool catalog_changed = false;
     for (auto& [id, handle] : handles_) {
         auto& task = tasks_.at(id);
@@ -796,7 +798,12 @@ bool Engine::update_snapshots_locked() {
         const bool progress_changed = previous_downloaded != task.downloaded_bytes
             || previous_download_rate != task.download_rate || previous_upload_rate != task.upload_rate
             || previous_peers != task.peers || previous_seeds != task.seeds;
-        if (state_changed || progress_changed) emit_task("event.taskUpdated", task);
+        if (state_changed || progress_changed) {
+            if (emit_events) emit_task("event.taskUpdated", task);
+            else pending_task_updates_.insert(id);
+        } else if (emit_events && pending_task_updates_.contains(id)) {
+            emit_task("event.taskUpdated", task);
+        }
         if (state_changed) request_resume_save_locked(id, false);
         catalog_changed = catalog_changed || state_changed;
     }
@@ -812,7 +819,7 @@ void Engine::worker_loop(std::stop_token stop_token) {
             if (initialized_ && session_) {
                 process_alerts_locked();
                 request_periodic_resume_saves_locked();
-                if (update_snapshots_locked()) persist_catalog_locked();
+                if (update_snapshots_locked(true)) persist_catalog_locked();
             }
         } catch (...) {
             // Request handlers surface persistent failures. The monitor must never terminate the process.
