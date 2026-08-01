@@ -1,2 +1,6 @@
 #Jetbrains
 .idea/
+
+# CMake/vcpkg build outputs
+out/
+vcpkg_installed/
