@@ -14,7 +14,7 @@
 ## 第 2 步：P0 任务语义（已完成基础实现）
 
 - [x] `.torrent` 绝对路径和 Magnet URI；
-- [x] UUID 任务 ID、info-hash + 规范化保存路径去重；
+- [x] UUID 任务 ID、同一 info-hash 会话级去重（避免 libtorrent 将不同保存路径静默别名到同一 handle）；
 - [x] metadata/checking/queued/downloading/paused/completed/error 状态；
 - [x] 500 ms 聚合进度事件（普通进度最多 2 次/秒）和单调序号；
 - [x] 完成后立即暂停，默认不继续做种；
@@ -37,11 +37,11 @@
 
 ## 第 4 步：发布级验证（待实现）
 
-- [ ] 本地 Tracker/Seeder 的单文件、多文件和 Magnet 集成测试；
+- [x] 本地 Tracker/Seeder 的单文件、多文件和 Magnet 集成测试；
 - [ ] 强制终止、断点恢复、磁盘不足、私有种子和安全删除 E2E；
 - [ ] CPU、工作集、磁盘吞吐和事件频率基准；
 - [ ] Release 依赖复制、第三方许可证/SBOM；
 - [ ] Flutter Release、侧载/升级 MSIX 和 Microsoft Store 包验证；
 - [ ] BangumiToday `BtEngineClient`、任务 Store 和 UI 接入。
 
-下一阶段应先完成本地 Tracker/Seeder 集成测试，再开始 Flutter/MSIX 接入；这样可在 UI 改造前验证下载、校验和崩溃恢复闭环。
+下一阶段应先补齐强制终止/断点恢复与安全删除 E2E，再开始 Flutter/MSIX 接入；这样可在 UI 改造前验证崩溃恢复和数据边界。

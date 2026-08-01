@@ -260,8 +260,9 @@ nlohmann::json Engine::add_task(const nlohmann::json& params) {
             fail(-32010, "SOURCE_INVALID", "invalid magnet URI");
         }
         info_hash = hash_string(add.info_hashes);
-        // Metadata must be validated before any payload file becomes eligible for download.
-        add.flags |= lt::torrent_flags::default_dont_download;
+        // Keep payload requests disabled until the untrusted metadata has passed validation.
+        add.flags |= lt::torrent_flags::upload_mode;
+        add.flags &= ~lt::torrent_flags::auto_managed;
     }
     add.save_path = path_utf8(save_validation.normalized);
     add.max_connections = config_.value("connectionsPerTask", 80);
@@ -269,14 +270,19 @@ nlohmann::json Engine::add_task(const nlohmann::json& params) {
     if (!start) add.flags |= lt::torrent_flags::paused;
 
     for (const auto& [id, task] : tasks_) {
-        if (task.info_hash == info_hash && std::filesystem::equivalent(task.save_path, save_validation.normalized, error)) {
-            fail(-32011, "DUPLICATE_TASK", "the torrent already exists at this save path", false, {{"taskId", id}});
+        if (task.info_hash == info_hash) {
+            const bool same_path = std::filesystem::equivalent(task.save_path, save_validation.normalized, error);
+            fail(-32011, "DUPLICATE_TASK",
+                same_path ? "the torrent already exists at this save path"
+                          : "the torrent is already active at another save path",
+                false, {{"taskId", id}, {"savePath", path_utf8(task.save_path)}});
         }
         error.clear();
     }
 
     auto handle = session_->add_torrent(std::move(add), error);
     if (error) fail(-32000, "ENGINE_ADD_FAILED", error.message(), true);
+    if (kind == "magnet" && start) handle.resume();
     TaskSnapshot task;
     task.id = new_task_id();
     task.state = kind == "magnet" && start ? TaskState::metadata : (start ? TaskState::queued : TaskState::paused);
@@ -340,7 +346,8 @@ nlohmann::json Engine::resume_task(const nlohmann::json& params) {
                 if (!validate_magnet_metadata_locked(task.id, handle->second, info)) return {{"task", task}};
                 task.state = TaskState::queued;
             } else {
-                handle->second.set_flags(lt::torrent_flags::default_dont_download);
+                handle->second.set_flags(lt::torrent_flags::upload_mode);
+                handle->second.unset_flags(lt::torrent_flags::auto_managed);
                 task.state = TaskState::metadata;
                 metadata_started_.insert_or_assign(task.id, std::chrono::steady_clock::now());
             }
@@ -491,12 +498,11 @@ void Engine::load_catalog_locked() {
                     && task.state != TaskState::paused && task.state != TaskState::completed
                     && task.state != TaskState::error;
                 if (stage_magnet_metadata) {
-                    add.flags |= lt::torrent_flags::default_dont_download;
-                    if (add.ti) {
-                        add.file_priorities.assign(static_cast<std::size_t>(add.ti->num_files()), lt::dont_download);
-                    }
+                    add.flags |= lt::torrent_flags::upload_mode;
+                    add.flags &= ~lt::torrent_flags::auto_managed;
                 } else if (task.source_kind == "magnet" && !add.ti) {
-                    add.flags |= lt::torrent_flags::default_dont_download;
+                    add.flags |= lt::torrent_flags::upload_mode;
+                    add.flags &= ~lt::torrent_flags::auto_managed;
                 }
                 if (task.state == TaskState::paused || task.state == TaskState::completed || task.state == TaskState::error) {
                     add.flags |= lt::torrent_flags::paused;
@@ -505,6 +511,7 @@ void Engine::load_catalog_locked() {
                 }
                 auto handle = session_->add_torrent(std::move(add), error);
                 if (error) throw std::runtime_error(error.message());
+                if (stage_magnet_metadata) handle.resume();
                 handles_.emplace(task.id, handle);
                 if (stage_magnet_metadata) {
                     metadata_started_.insert_or_assign(task.id, std::chrono::steady_clock::now());
@@ -655,10 +662,8 @@ bool Engine::validate_magnet_metadata_locked(const std::string& id,
         return false;
     }
 
-    std::vector<lt::download_priority_t> priorities(
-        static_cast<std::size_t>(info->num_files()), lt::default_priority);
-    handle.prioritize_files(priorities);
-    handle.unset_flags(lt::torrent_flags::default_dont_download);
+    handle.unset_flags(lt::torrent_flags::upload_mode);
+    handle.set_flags(lt::torrent_flags::auto_managed);
     task.save_path = save_validation.normalized;
     task.total_bytes = required;
     task.private_torrent = info->priv();

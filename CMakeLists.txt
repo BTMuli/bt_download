@@ -53,4 +53,17 @@ if(BT_DOWNLOAD_BUILD_TESTS)
     )
     target_link_libraries(bt_download_tests PRIVATE bt_download_core)
     add_test(NAME bt_download_tests COMMAND bt_download_tests)
+
+    add_executable(bt_download_integration_tests
+        tests/download_integration_test.cpp
+    )
+    target_link_libraries(bt_download_integration_tests PRIVATE bt_download_core)
+    if(WIN32)
+        target_link_libraries(bt_download_integration_tests PRIVATE ws2_32)
+    endif()
+    add_test(NAME bt_download_integration_tests COMMAND bt_download_integration_tests)
+    set_tests_properties(bt_download_integration_tests PROPERTIES
+        LABELS integration
+        TIMEOUT 90
+    )
 endif()
