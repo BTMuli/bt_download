@@ -38,10 +38,11 @@
 ## 第 4 步：发布级验证（待实现）
 
 - [x] 本地 Tracker/Seeder 的单文件、多文件和 Magnet 集成测试；
-- [ ] 强制终止、断点恢复、磁盘不足、私有种子和安全删除 E2E；
+- [x] 强制终止、断点恢复和安全删除 E2E；
+- [ ] 磁盘不足与私有种子 E2E；
 - [ ] CPU、工作集、磁盘吞吐和事件频率基准；
 - [ ] Release 依赖复制、第三方许可证/SBOM；
 - [ ] Flutter Release、侧载/升级 MSIX 和 Microsoft Store 包验证；
 - [ ] BangumiToday `BtEngineClient`、任务 Store 和 UI 接入。
 
-下一阶段应先补齐强制终止/断点恢复与安全删除 E2E，再开始 Flutter/MSIX 接入；这样可在 UI 改造前验证崩溃恢复和数据边界。
+下一阶段应补齐磁盘不足与私有种子 E2E，再开始 Flutter/MSIX 接入；这样可在 UI 改造前验证错误与隐私边界。

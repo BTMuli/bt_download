@@ -9,6 +9,7 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -18,6 +19,7 @@
 #include <libtorrent/add_torrent_params.hpp>
 #include <libtorrent/create_torrent.hpp>
 #include <libtorrent/error_code.hpp>
+#include <libtorrent/read_resume_data.hpp>
 #include <libtorrent/settings_pack.hpp>
 #include <libtorrent/torrent_flags.hpp>
 #include <libtorrent/torrent_info.hpp>
@@ -26,6 +28,7 @@
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <windows.h>
 #else
 #error The local tracker integration test currently requires Windows sockets
 #endif
@@ -75,6 +78,68 @@ public:
 
     ~WinsockRuntime() { WSACleanup(); }
 };
+
+class ChildProcess {
+public:
+    explicit ChildProcess(const std::vector<std::filesystem::path>& arguments) {
+        expect(!arguments.empty(), "child process requires an executable path");
+        std::wstring command_line;
+        for (const auto& argument : arguments) {
+            if (!command_line.empty()) command_line.push_back(L' ');
+            command_line.push_back(L'\"');
+            command_line.append(argument.wstring());
+            command_line.push_back(L'\"');
+        }
+        STARTUPINFOW startup{};
+        startup.cb = sizeof(startup);
+        PROCESS_INFORMATION process{};
+        auto mutable_command_line = command_line;
+        if (!CreateProcessW(arguments.front().c_str(), mutable_command_line.data(), nullptr, nullptr, FALSE,
+                CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process)) {
+            throw std::runtime_error("cannot start recovery child process: " + std::to_string(GetLastError()));
+        }
+        process_ = process.hProcess;
+        CloseHandle(process.hThread);
+    }
+
+    ~ChildProcess() {
+        if (process_ == nullptr) return;
+        if (WaitForSingleObject(process_, 0) == WAIT_TIMEOUT) {
+            TerminateProcess(process_, 1);
+            WaitForSingleObject(process_, 5000);
+        }
+        CloseHandle(process_);
+    }
+
+    ChildProcess(const ChildProcess&) = delete;
+    ChildProcess& operator=(const ChildProcess&) = delete;
+
+    void terminate() {
+        expect(process_ != nullptr, "recovery child process is not running");
+        expect(TerminateProcess(process_, 137) != FALSE,
+            "cannot terminate recovery child process");
+        expect(WaitForSingleObject(process_, 5000) == WAIT_OBJECT_0,
+            "recovery child process did not terminate");
+    }
+
+    std::optional<DWORD> exit_code() const {
+        DWORD code = STILL_ACTIVE;
+        if (process_ == nullptr || GetExitCodeProcess(process_, &code) == FALSE || code == STILL_ACTIVE) {
+            return std::nullopt;
+        }
+        return code;
+    }
+
+private:
+    HANDLE process_{nullptr};
+};
+
+std::filesystem::path current_executable_path() {
+    std::vector<wchar_t> buffer(32768);
+    const auto length = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+    expect(length > 0 && length < buffer.size(), "cannot resolve integration test executable path");
+    return std::filesystem::path(std::wstring(buffer.data(), length));
+}
 
 class LocalHttpTracker {
 public:
@@ -311,6 +376,121 @@ std::string add_torrent_task(bt::Engine& engine, const std::filesystem::path& to
     return result.at("task").at("id").get<std::string>();
 }
 
+nlohmann::json wait_for_json_file(const std::filesystem::path& path, const ChildProcess& child) {
+    const auto deadline = std::chrono::steady_clock::now() + 20s;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (const auto exit_code = child.exit_code()) {
+            throw std::runtime_error("recovery child exited before its checkpoint with code "
+                + std::to_string(*exit_code));
+        }
+        if (std::filesystem::is_regular_file(path)) {
+            try {
+                std::ifstream input(path, std::ios::binary);
+                return nlohmann::json::parse(input);
+            } catch (const nlohmann::json::exception&) {
+            }
+        }
+        std::this_thread::sleep_for(50ms);
+    }
+    throw std::runtime_error("recovery child did not publish a checkpoint");
+}
+
+void wait_for_recovered_checkpoint(bt::Engine& engine, const std::string& id,
+    std::uint64_t checkpoint_bytes) {
+    const auto deadline = std::chrono::steady_clock::now() + 15s;
+    nlohmann::json task;
+    while (std::chrono::steady_clock::now() < deadline) {
+        task = engine.dispatch("task.get", {{"id", id}}).at("task");
+        if (task.at("state") == "error") {
+            throw std::runtime_error("restored download entered error state: " + task.at("lastError").dump());
+        }
+        const auto state = task.at("state").get<std::string>();
+        if ((state == "downloading" || state == "completed")
+            && task.at("downloadedBytes").get<std::uint64_t>() >= checkpoint_bytes) {
+            return;
+        }
+        std::this_thread::sleep_for(100ms);
+    }
+    throw std::runtime_error("restored task regressed behind its persisted checkpoint: " + task.dump());
+}
+
+void wait_for_removal(const std::filesystem::path& payload) {
+    const auto deadline = std::chrono::steady_clock::now() + 10s;
+    while (std::filesystem::exists(payload) && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(50ms);
+    }
+    expect(!std::filesystem::exists(payload), "deleteData did not remove the torrent payload");
+}
+
+std::optional<std::uint64_t> persisted_checkpoint_bytes(const std::filesystem::path& resume_path) {
+    try {
+        if (!std::filesystem::is_regular_file(resume_path)) return std::nullopt;
+        std::ifstream input(resume_path, std::ios::binary);
+        std::vector<char> bytes(std::istreambuf_iterator<char>(input), {});
+        if (bytes.empty()) return std::nullopt;
+        lt::error_code error;
+        const auto resume = lt::read_resume_data(lt::span<const char>(bytes.data(), bytes.size()), error);
+        if (error || !resume.ti) return std::nullopt;
+        std::uint64_t checkpoint = 0;
+        for (const auto index : resume.have_pieces.range()) {
+            if (resume.have_pieces[index]) {
+                checkpoint += static_cast<std::uint64_t>(resume.ti->piece_size(index));
+            }
+        }
+        return checkpoint;
+    } catch (const std::exception&) {
+        return std::nullopt;
+    }
+}
+
+int run_recovery_child(const std::filesystem::path& torrent_path,
+    const std::filesystem::path& save_path, const std::filesystem::path& state_path,
+    const std::filesystem::path& checkpoint_path) {
+    bt::Engine engine([](const std::string&, const nlohmann::json&) {});
+    engine.dispatch("engine.initialize", {
+        {"protocolVersion", "1.0"},
+        {"statePath", path_utf8(state_path)},
+        {"config", {{"activeDownloads", 1}, {"downloadRateLimit", 512 * 1024}}},
+    });
+    const auto id = add_torrent_task(engine, torrent_path, save_path);
+    nlohmann::json task;
+    const auto progress_deadline = std::chrono::steady_clock::now() + 15s;
+    while (std::chrono::steady_clock::now() < progress_deadline) {
+        task = engine.dispatch("task.get", {{"id", id}}).at("task");
+        const auto downloaded = task.at("downloadedBytes").get<std::uint64_t>();
+        const auto total = task.at("totalBytes").get<std::uint64_t>();
+        if (downloaded >= 384 * 1024 && downloaded < total) break;
+        if (task.at("state") == "error") {
+            throw std::runtime_error("recovery child download failed: " + task.at("lastError").dump());
+        }
+        std::this_thread::sleep_for(50ms);
+    }
+    const auto observed_bytes = task.at("downloadedBytes").get<std::uint64_t>();
+    expect(observed_bytes >= 384 * 1024 && observed_bytes < task.at("totalBytes").get<std::uint64_t>(),
+        "recovery child did not reach partial progress");
+
+    const auto resume_path = state_path / "resume" / (id + ".fastresume");
+    engine.dispatch("task.pause", {{"id", id}});
+    const auto resume_deadline = std::chrono::steady_clock::now() + 10s;
+    std::uint64_t checkpoint_bytes = 0;
+    while (std::chrono::steady_clock::now() < resume_deadline) {
+        checkpoint_bytes = persisted_checkpoint_bytes(resume_path).value_or(0);
+        if (checkpoint_bytes >= 384 * 1024) break;
+        std::this_thread::sleep_for(50ms);
+    }
+    expect(checkpoint_bytes >= 384 * 1024,
+        "recovery child did not persist completed pieces at its checkpoint");
+
+    engine.dispatch("task.resume", {{"id", id}});
+    {
+        std::ofstream output(checkpoint_path, std::ios::binary | std::ios::trunc);
+        output << nlohmann::json({{"id", id}, {"checkpointBytes", checkpoint_bytes}}).dump();
+        output.flush();
+        expect(static_cast<bool>(output), "recovery child cannot publish its checkpoint");
+    }
+    while (true) std::this_thread::sleep_for(1s);
+}
+
 void run_download_integration_test() {
     WinsockRuntime winsock;
     TemporaryDirectory temporary;
@@ -320,17 +500,21 @@ void run_download_integration_test() {
     const auto single_source = seed_root / "single.bin";
     const auto bundle_source = seed_root / "bundle";
     const auto magnet_source = seed_root / "magnet.bin";
+    const auto recovery_source = seed_root / "recovery.bin";
     write_payload(single_source, 180 * 1024 + 73, 11);
     write_payload(bundle_source / "first.bin", 96 * 1024 + 19, 23);
     write_payload(bundle_source / "nested" / "second.bin", 144 * 1024 + 41, 31);
     write_payload(magnet_source, 192 * 1024 + 29, 47);
+    write_payload(recovery_source, 4 * 1024 * 1024 + 113, 59);
 
     const auto single_torrent_path = temporary.path() / "single.torrent";
     const auto bundle_torrent_path = temporary.path() / "bundle.torrent";
     const auto magnet_torrent_path = temporary.path() / "magnet.torrent";
+    const auto recovery_torrent_path = temporary.path() / "recovery.torrent";
     const auto single_info = create_torrent_file(single_source, single_torrent_path, tracker.announce_url());
     const auto bundle_info = create_torrent_file(bundle_source, bundle_torrent_path, tracker.announce_url());
     const auto magnet_info = create_torrent_file(magnet_source, magnet_torrent_path, tracker.announce_url());
+    const auto recovery_info = create_torrent_file(recovery_source, recovery_torrent_path, tracker.announce_url());
 
     lt::settings_pack seed_settings;
     seed_settings.set_str(lt::settings_pack::listen_interfaces, "127.0.0.1:0");
@@ -344,9 +528,10 @@ void run_download_integration_test() {
     const auto single_seed = add_seed(seeder, single_info, seed_root);
     const auto bundle_seed = add_seed(seeder, bundle_info, seed_root);
     const auto magnet_seed = add_seed(seeder, magnet_info, seed_root);
-    expect(single_seed.is_valid() && bundle_seed.is_valid() && magnet_seed.is_valid(),
+    const auto recovery_seed = add_seed(seeder, recovery_info, seed_root);
+    expect(single_seed.is_valid() && bundle_seed.is_valid() && magnet_seed.is_valid() && recovery_seed.is_valid(),
         "local seeder handle is invalid");
-    wait_for_seeds({single_seed, bundle_seed, magnet_seed});
+    wait_for_seeds({single_seed, bundle_seed, magnet_seed, recovery_seed});
     bt::Engine engine([](const std::string&, const nlohmann::json&) {});
     engine.dispatch("engine.initialize", {
         {"protocolVersion", "1.0"},
@@ -406,12 +591,50 @@ void run_download_integration_test() {
         "magnet payload differs from seed");
 
     engine.dispatch("engine.shutdown", nlohmann::json::object());
+
+    const auto recovery_download = temporary.path() / "recovery-download";
+    const auto recovery_state = temporary.path() / "recovery-state";
+    const auto recovery_checkpoint = temporary.path() / "recovery-checkpoint.json";
+    const auto unrelated_file = recovery_download / "keep.me";
+    std::filesystem::create_directories(recovery_download);
+    write_payload(unrelated_file, 37, 71);
+    ChildProcess recovery_child({current_executable_path(), "--recovery-child", recovery_torrent_path,
+        recovery_download, recovery_state, recovery_checkpoint});
+    const auto checkpoint = wait_for_json_file(recovery_checkpoint, recovery_child);
+    const auto recovery_id = checkpoint.at("id").get<std::string>();
+    const auto checkpoint_bytes = checkpoint.at("checkpointBytes").get<std::uint64_t>();
+    recovery_child.terminate();
+
+    bt::Engine restored([](const std::string&, const nlohmann::json&) {});
+    const auto initialized = restored.dispatch("engine.initialize", {
+        {"protocolVersion", "1.0"}, {"statePath", path_utf8(recovery_state)}});
+    expect(initialized.at("restoredTasks") == 1, "forced termination task was not restored");
+    restored.dispatch("engine.configure", {{"downloadRateLimit", 1024}});
+    wait_for_recovered_checkpoint(restored, recovery_id, checkpoint_bytes);
+    restored.dispatch("engine.configure", {{"downloadRateLimit", 512 * 1024}});
+    const auto recovered_task = wait_for_completion(restored, recovery_id, tracker, recovery_seed);
+    expect(recovered_task.at("downloadedBytes") == recovered_task.at("totalBytes"),
+        "restored task did not report complete byte counts");
+    expect(read_bytes(recovery_source) == read_bytes(recovery_download / "recovery.bin"),
+        "restored payload differs from seed");
+
+    const auto remove_recovered = restored.dispatch("task.remove",
+        {{"id", recovery_id}, {"deleteData", true}});
+    expect(remove_recovered.at("removed") == true && remove_recovered.at("dataDeleted") == true,
+        "restored task did not accept explicit data deletion");
+    wait_for_removal(recovery_download / "recovery.bin");
+    expect(std::filesystem::is_regular_file(unrelated_file),
+        "deleteData crossed the torrent payload boundary");
+    restored.dispatch("engine.shutdown", nlohmann::json::object());
 }
 
 } // namespace
 
-int main() {
+int main(int argc, char* argv[]) {
     try {
+        if (argc == 6 && std::string_view(argv[1]) == "--recovery-child") {
+            return run_recovery_child(argv[2], argv[3], argv[4], argv[5]);
+        }
         run_download_integration_test();
         std::cout << "Local tracker/seeder integration test passed\n";
         return 0;
