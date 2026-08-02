@@ -2,6 +2,8 @@
 
 协议版本：`1.0`。传输为继承的 stdin/stdout 管道，编码为 UTF-8，每个 JSON-RPC 2.0 对象独占一行。单帧最大 1 MiB。客户端必须同时持续读取 stdout 和 stderr；stdout 不包含日志。
 
+> Tracker 补充、限量做种和 `seeding` 状态属于拟议的 `1.1` 扩展，尚未由当前实现提供。完整语义见 [tracker-and-seeding.md](tracker-and-seeding.md)，不能按本文的 `1.0` 已实现能力使用。
+
 ## 生命周期
 
 1. 客户端启动 `bt_download.exe`。
@@ -34,6 +36,28 @@
 
 配置字段以字节/秒、秒和计数为单位：`activeDownloads`、`downloadRateLimit`、`uploadRateLimit`、`connectionsLimit`、`connectionsPerTask`、`metadataTimeoutSeconds`。速率 `0` 表示不限速；Magnet 元数据超时默认 300 秒，取值范围为 1 至 86400 秒。
 
+## 拟议的 `1.1` 扩展
+
+`engine.initialize` 的 `config` 和 `engine.configure` 拟新增：
+
+```json
+{
+  "additionalTrackers": ["udp://tracker.example:6969/announce"],
+  "seedingEnabled": true,
+  "seedRatioLimit": 2.0,
+  "seedTimeLimitMinutes": 60
+}
+```
+
+- `additionalTrackers` 最多 512 条，只接受合法的 `udp`、`http`、`https` Tracker URL；
+- `seedingEnabled=false` 表示文件完成后立即停止；启用时至少一个停止条件大于 0；
+- 分享率与时间条件同时启用时，任一条件先满足即停止；
+- 配置整体验证并原子生效，非法配置返回 `INVALID_CONFIG`；
+- 任务状态新增 `seeding`，快照新增 `uploadedBytes`、`shareRatio`、`seedingSeconds`、`seedRatioLimit`、`seedTimeLimitMinutes` 和 `seedStopReason`；
+- 文件可用通知发生在完整性校验完成时，不等待做种结束。
+
+`1.1` 的 Tracker 列表源、自动更新时间和最后同步错误由 BangumiToday 管理，不通过本地引擎协议传输。
+
 ## 错误
 
 JSON-RPC `error.data` 至少包含稳定的业务 `code` 与 `retryable`。调用方不得依赖面向用户的 `message` 做分支判断。
@@ -42,7 +66,7 @@ JSON-RPC `error.data` 至少包含稳定的业务 `code` 与 `retryable`。调�
 {"jsonrpc":"2.0","id":"2","error":{"code":-32011,"message":"the torrent already exists at this save path","data":{"code":"DUPLICATE_TASK","retryable":false,"taskId":"..."}}}
 ```
 
-常用业务码包括 `NOT_INITIALIZED`、`PROTOCOL_MISMATCH`、`SOURCE_INVALID`、`SOURCE_UNSUPPORTED`、`UNSAFE_TORRENT_PATH`、`METADATA_TIMEOUT`、`SAVE_PATH_INVALID`、`SAVE_PATH_UNAVAILABLE`、`SAVE_PATH_NOT_WRITABLE`、`DISK_FULL`、`STORAGE_ERROR`、`DATA_VERIFICATION_FAILED`、`NETWORK_UNAVAILABLE`、`DUPLICATE_TASK`、`TASK_NOT_FOUND`、`TASK_UNAVAILABLE`、`PERSISTENCE_ERROR`、`TORRENT_ERROR` 和 `INTERNAL_ERROR`。任务快照的 `lastError` 使用同一组业务码和 `retryable` 语义。
+常用业务码包括 `NOT_INITIALIZED`、`PROTOCOL_MISMATCH`、`INVALID_CONFIG`、`SOURCE_INVALID`、`SOURCE_UNSUPPORTED`、`UNSAFE_TORRENT_PATH`、`METADATA_TIMEOUT`、`SAVE_PATH_INVALID`、`SAVE_PATH_UNAVAILABLE`、`SAVE_PATH_NOT_WRITABLE`、`DISK_FULL`、`STORAGE_ERROR`、`DATA_VERIFICATION_FAILED`、`NETWORK_UNAVAILABLE`、`DUPLICATE_TASK`、`TASK_NOT_FOUND`、`TASK_UNAVAILABLE`、`PERSISTENCE_ERROR`、`TORRENT_ERROR` 和 `INTERNAL_ERROR`。任务快照的 `lastError` 使用同一组业务码和 `retryable` 语义。
 
 ## 事件
 

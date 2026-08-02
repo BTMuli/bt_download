@@ -12,7 +12,7 @@
 - 本地任务目录与 fast-resume 恢复、稳定错误模型和单调事件序号；
 - Windows x64 Debug/Release 构建与协议/状态机/路径单元测试。
 
-完整需求和分阶段里程碑见 [docs/requirements.md](docs/requirements.md)，当前实现边界见 [docs/implementation.md](docs/implementation.md)，调用契约见 [docs/protocol.md](docs/protocol.md)。
+完整需求和分阶段里程碑见 [docs/requirements.md](docs/requirements.md)，Tracker 与限量做种专项需求见 [docs/tracker-and-seeding.md](docs/tracker-and-seeding.md)，当前实现边界见 [docs/implementation.md](docs/implementation.md)，调用契约见 [docs/protocol.md](docs/protocol.md)。
 
 参与开发前请阅读 [贡献指南](CONTRIBUTING.md)。所有提交均采用 Gitmoji 格式。
 
