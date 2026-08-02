@@ -42,6 +42,10 @@ void run_config_tests() {
         "tracker fragment was accepted");
 
     bt::EngineConfig config;
+    expect(config.active_downloads == 4 && config.download_rate_limit == 0
+            && config.upload_rate_limit == 0 && config.connections_limit == 256
+            && config.connections_per_task == 64 && !config.seeding_enabled,
+        "product download defaults are incorrect");
     config = bt::apply_config_patch(config, {
         {"additionalTrackers", nlohmann::json::array({"udp://tracker.example:6969/announce"})},
         {"seedingEnabled", true}, {"seedRatioLimit", 2.0}, {"seedTimeLimitMinutes", 60}});

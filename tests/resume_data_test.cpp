@@ -140,6 +140,14 @@ void run_resume_data_tests() {
             {"source", {{"kind", "torrentFile"}, {"path", path_utf8(torrent_path)}}},
             {"savePath", path_utf8(save_path)}, {"start", false}});
         task_id = added.at("task").at("id").get<std::string>();
+        const auto details = engine.dispatch("task.details", {{"id", task_id}});
+        expect(details.at("pieceCount") == 1 && details.at("pieceLength") == 16 * 1024,
+            "task details did not expose torrent pieces");
+        expect(details.at("files").size() == 1
+                && details.at("files").front().at("path") == "payload.bin",
+            "task details did not expose torrent files");
+        expect(details.at("peers").is_array() && details.at("completedPieces").is_string(),
+            "task details returned invalid dynamic sections");
         const auto resume_path = state_path / "resume" / (task_id + ".fastresume");
         engine.dispatch("task.pause", {{"id", task_id}});
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);

@@ -9,11 +9,11 @@
 namespace bt {
 
 struct EngineConfig {
-    int active_downloads{2};
+    int active_downloads{4};
     std::int64_t download_rate_limit{0};
-    std::int64_t upload_rate_limit{1024 * 1024};
-    int connections_limit{200};
-    int connections_per_task{80};
+    std::int64_t upload_rate_limit{0};
+    int connections_limit{256};
+    int connections_per_task{64};
     int metadata_timeout_seconds{300};
     std::vector<std::string> additional_trackers;
     bool seeding_enabled{false};

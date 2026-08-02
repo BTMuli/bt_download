@@ -39,6 +39,7 @@ private:
     nlohmann::json add_task(const nlohmann::json& params);
     nlohmann::json list_tasks();
     nlohmann::json get_task(const nlohmann::json& params);
+    nlohmann::json get_task_details(const nlohmann::json& params);
     nlohmann::json pause_task(const nlohmann::json& params);
     nlohmann::json resume_task(const nlohmann::json& params);
     nlohmann::json retry_task(const nlohmann::json& params);

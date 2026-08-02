@@ -23,6 +23,7 @@
 | `task.add` | `source`, `savePath` | 添加 torrentFile 或 magnet |
 | `task.list` | - | 返回全量快照与当前事件序号 |
 | `task.get` | `id` | 返回单任务快照 |
+| `task.details` | `id` | 返回任务快照、分片完成状态、文件进度和当前 Peer；文件和 Peer 列表可能截断 |
 | `task.pause` / `task.resume` | `id` | 持久暂停或继续 |
 | `task.retry` / `task.recheck` | `id` | 重试错误或强制校验 |
 | `task.remove` | `id`, 可选 `deleteData` | 默认只移除任务 |
@@ -35,6 +36,8 @@
 ```
 
 配置字段以字节/秒、秒、分钟和计数为单位：`activeDownloads`、`downloadRateLimit`、`uploadRateLimit`、`connectionsLimit`、`connectionsPerTask`、`metadataTimeoutSeconds`、`additionalTrackers`、`seedingEnabled`、`seedRatioLimit`、`seedTimeLimitMinutes`。速率 `0` 表示不限速；Magnet 元数据超时默认 300 秒，取值范围为 1 至 86400 秒。
+
+产品默认值为并行任务 `4`、下载和上传均不限速、全局连接 `256`、单任务连接 `64`，下载完成后继续做种。
 
 Tracker 与做种配置示例：
 
