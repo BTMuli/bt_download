@@ -33,7 +33,8 @@
 - [x] libtorrent fast-resume 数据的关键状态/30 秒周期保存、最终保存和恢复加载，损坏文件按任务隔离；
 - [x] Magnet 元数据取得后的路径/空间二次检查与明确的元数据超时；
 - [x] libtorrent alert 到业务错误码的细粒度映射；
-- [ ] Windows Job Object 父子进程监管（由 BangumiToday 启动端配合）。
+- [x] Windows Job Object 父子进程监管（由 BangumiToday 启动端持有
+  `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` 句柄）。
 
 ## 第 4 步：发布级验证（待实现）
 
@@ -42,7 +43,8 @@
 - [x] 磁盘不足与私有种子 E2E；
 - [x] CPU、工作集、磁盘吞吐和事件频率基准；
 - [x] Release 依赖复制、第三方许可证/SBOM；
-- [ ] Flutter Release、侧载/升级 MSIX 和 Microsoft Store 包验证；
-- [ ] BangumiToday `BtEngineClient`、任务 Store 和 UI 接入。
+- [x] BangumiToday `BtEngineClient`、任务 Store 和 UI 接入；
+- [x] Flutter Release/MSIX 构建接入与伴随进程产物完整性校验；
+- [ ] 侧载/升级 MSIX 和 Microsoft Store 包实机验证。
 
-下一阶段应把完整 Release 安装目录接入 Flutter/MSIX 构建，并验证侧载、升级安装和 Store 包环境下的进程启动与状态恢复。
+下一阶段应在侧载、升级安装和 Store 包实机环境下验证进程启动、父进程强制结束监管与状态恢复。
