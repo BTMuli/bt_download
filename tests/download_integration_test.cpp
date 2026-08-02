@@ -284,7 +284,7 @@ std::shared_ptr<lt::torrent_info> create_torrent_file(
     lt::file_storage storage;
     lt::add_files(storage, path_utf8(payload));
     lt::create_torrent torrent(storage, 16 * 1024, lt::create_torrent::v1_only);
-    torrent.add_tracker(announce_url);
+    if (!announce_url.empty()) torrent.add_tracker(announce_url);
     torrent.set_creator("bt_download integration test");
     torrent.set_priv(private_torrent);
     lt::error_code error;
@@ -410,6 +410,22 @@ nlohmann::json wait_for_completion(bt::Engine& engine, const std::string& id, co
         + "); seeder peers=" + std::to_string(seed_status.num_peers)
         + ", uploads=" + std::to_string(seed_status.total_upload)
         + "; last task snapshot: " + task.dump());
+}
+
+nlohmann::json wait_for_state(bt::Engine& engine, const std::string& id, std::string_view expected,
+    std::chrono::seconds timeout = 30s) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    nlohmann::json task;
+    while (std::chrono::steady_clock::now() < deadline) {
+        task = engine.dispatch("task.get", {{"id", id}}).at("task");
+        if (task.at("state").get<std::string>() == expected) return task;
+        if (task.at("state") == "error") {
+            throw std::runtime_error("task entered error state: " + task.at("lastError").dump());
+        }
+        std::this_thread::sleep_for(100ms);
+    }
+    throw std::runtime_error("task did not enter expected state " + std::string(expected)
+        + "; last snapshot: " + task.dump());
 }
 
 std::string add_torrent_task(bt::Engine& engine, const std::filesystem::path& torrent,
@@ -709,6 +725,172 @@ void run_download_integration_test() {
     restored.dispatch("engine.shutdown", nlohmann::json::object());
 }
 
+void run_tracker_and_seeding_integration_test() {
+    WinsockRuntime winsock;
+    TemporaryDirectory temporary;
+    LocalHttpTracker origin_tracker;
+    LocalHttpTracker supplemental_tracker;
+    LocalHttpTracker private_spy_tracker;
+
+    const auto seed_root = temporary.path() / "seed";
+    const auto public_source = seed_root / "supplemental.bin";
+    const auto private_source = seed_root / "private-supplemental.bin";
+    const auto seeding_source = seed_root / "limited-seeding.bin";
+    write_payload(public_source, 384 * 1024 + 17, 83);
+    write_payload(private_source, 320 * 1024 + 23, 89);
+    write_payload(seeding_source, 1024 * 1024 + 31, 97);
+
+    const auto public_torrent_path = temporary.path() / "supplemental.torrent";
+    const auto private_torrent_path = temporary.path() / "private-supplemental.torrent";
+    const auto seeding_torrent_path = temporary.path() / "limited-seeding.torrent";
+    const auto public_info = create_torrent_file(public_source, public_torrent_path, "");
+    const auto private_info = create_torrent_file(
+        private_source, private_torrent_path, origin_tracker.announce_url(), true);
+    const auto seeding_info = create_torrent_file(
+        seeding_source, seeding_torrent_path, origin_tracker.announce_url());
+
+    lt::settings_pack peer_settings;
+    peer_settings.set_str(lt::settings_pack::listen_interfaces, "127.0.0.1:0");
+    peer_settings.set_bool(lt::settings_pack::enable_dht, false);
+    peer_settings.set_bool(lt::settings_pack::enable_lsd, false);
+    peer_settings.set_bool(lt::settings_pack::enable_upnp, false);
+    peer_settings.set_bool(lt::settings_pack::enable_natpmp, false);
+    lt::session seeder(peer_settings);
+    expect(seeder.listen_port() != 0, "Tracker/seeding test seeder did not listen");
+    origin_tracker.set_peer_port(seeder.listen_port());
+    supplemental_tracker.set_peer_port(seeder.listen_port());
+    const auto public_seed = add_seed(seeder, public_info, seed_root);
+    const auto private_seed = add_seed(seeder, private_info, seed_root);
+    const auto limited_seed = add_seed(seeder, seeding_info, seed_root);
+    wait_for_seeds({public_seed, private_seed, limited_seed});
+
+    {
+        const auto download = temporary.path() / "supplemental-download";
+        std::filesystem::create_directories(download);
+        bt::Engine engine([](const std::string&, const nlohmann::json&) {});
+        engine.dispatch("engine.initialize", {
+            {"protocolVersion", "1.1"}, {"statePath", path_utf8(temporary.path() / "tracker-state")}});
+        const auto id = add_torrent_task(engine, public_torrent_path, download);
+        std::this_thread::sleep_for(500ms);
+        engine.dispatch("engine.configure", {
+            {"additionalTrackers", nlohmann::json::array({supplemental_tracker.announce_url()})}});
+        const auto task = wait_for_completion(engine, id, supplemental_tracker, public_seed);
+        expect(task.at("seedStopReason") == "disabled",
+            "protocol 1.1 safe default did not stop seeding");
+        expect(supplemental_tracker.announce_count() > 0,
+            "dynamically configured supplemental Tracker was not announced");
+        engine.dispatch("engine.shutdown", nlohmann::json::object());
+    }
+
+    {
+        const auto download = temporary.path() / "private-supplemental-download";
+        std::filesystem::create_directories(download);
+        bt::Engine engine([](const std::string&, const nlohmann::json&) {});
+        engine.dispatch("engine.initialize", {
+            {"protocolVersion", "1.1"}, {"statePath", path_utf8(temporary.path() / "private-tracker-state")},
+            {"config", {{"additionalTrackers", nlohmann::json::array({private_spy_tracker.announce_url()})}}}});
+        const auto observed_before = origin_tracker.observed_peer_count();
+        const auto added = engine.dispatch("task.add", {
+            {"source", {{"kind", "magnet"}, {"uri", magnet_uri(*private_info, origin_tracker)}}},
+            {"savePath", path_utf8(download)}, {"start", true}});
+        expect(added.at("task").at("state") == "metadata",
+            "private Magnet did not start in metadata state");
+        const auto id = added.at("task").at("id").get<std::string>();
+        const auto announce_deadline = std::chrono::steady_clock::now() + 5s;
+        while (origin_tracker.observed_peer_count() == observed_before
+            && std::chrono::steady_clock::now() < announce_deadline) {
+            std::this_thread::sleep_for(100ms);
+        }
+        expect(origin_tracker.observed_peer_count() > observed_before,
+            "private Magnet did not announce to its embedded origin Tracker");
+        expect(private_spy_tracker.announce_count() == 0,
+            "metadata-pending Magnet leaked its info-hash to a supplemental Tracker");
+        engine.dispatch("task.remove", {{"id", id}, {"deleteData", false}});
+
+        const auto private_id = add_torrent_task(engine, private_torrent_path, download);
+        const auto task = wait_for_completion(engine, private_id, origin_tracker, private_seed);
+        expect(task.at("private") == true, "private supplemental Tracker test lost private flag");
+        std::this_thread::sleep_for(500ms);
+        expect(private_spy_tracker.announce_count() == 0,
+            "private torrent leaked its info-hash to a supplemental Tracker");
+        engine.dispatch("engine.shutdown", nlohmann::json::object());
+    }
+
+    {
+        const auto download = temporary.path() / "limited-seeding-download";
+        const auto leecher_download = temporary.path() / "limited-seeding-leecher";
+        const auto seeding_state_path = temporary.path() / "seeding-state";
+        std::filesystem::create_directories(download);
+        std::filesystem::create_directories(leecher_download);
+        std::string id;
+        std::uint16_t first_engine_peer_port = 0;
+        {
+            bt::Engine engine([](const std::string&, const nlohmann::json&) {});
+            engine.dispatch("engine.initialize", {
+                {"protocolVersion", "1.1"}, {"statePath", path_utf8(seeding_state_path)},
+                {"config", {{"seedingEnabled", true}, {"seedRatioLimit", 0.1},
+                    {"seedTimeLimitMinutes", 0}}}});
+            id = add_torrent_task(engine, seeding_torrent_path, download);
+            const auto seeding_task = wait_for_state(engine, id, "seeding");
+            expect(seeding_task.at("seedStopReason").is_null(),
+                "limited seeding task stopped before a limit was reached");
+            first_engine_peer_port = origin_tracker.last_observed_peer_port();
+            expect(first_engine_peer_port != 0 && first_engine_peer_port != seeder.listen_port(),
+                "Tracker did not observe the engine peer port");
+            const auto paused = engine.dispatch("task.pause", {{"id", id}}).at("task");
+            expect(paused.at("state") == "paused", "seeding task did not pause");
+            engine.dispatch("engine.shutdown", nlohmann::json::object());
+        }
+
+        bt::Engine restored([](const std::string&, const nlohmann::json&) {});
+        const auto initialized = restored.dispatch("engine.initialize", {
+            {"protocolVersion", "1.1"}, {"statePath", path_utf8(seeding_state_path)}});
+        expect(initialized.at("restoredTasks") == 1, "paused seeding task was not restored");
+        expect(restored.dispatch("task.get", {{"id", id}}).at("task").at("state") == "paused",
+            "restored seeding task lost its paused state");
+        origin_tracker.set_peer_port(seeder.listen_port());
+        restored.dispatch("task.resume", {{"id", id}});
+        wait_for_state(restored, id, "seeding");
+        const auto port_deadline = std::chrono::steady_clock::now() + 5s;
+        while (origin_tracker.last_observed_peer_port() == first_engine_peer_port
+            && std::chrono::steady_clock::now() < port_deadline) {
+            std::this_thread::sleep_for(100ms);
+        }
+        const auto engine_peer_port = origin_tracker.last_observed_peer_port();
+        expect(engine_peer_port != 0 && engine_peer_port != seeder.listen_port(),
+            "Tracker did not observe the restored engine peer port");
+        origin_tracker.set_peer_port(engine_peer_port);
+
+        lt::session leecher(peer_settings);
+        lt::add_torrent_params add;
+        add.ti = seeding_info;
+        add.save_path = path_utf8(leecher_download);
+        add.flags &= ~lt::torrent_flags::paused;
+        add.flags &= ~lt::torrent_flags::auto_managed;
+        lt::error_code error;
+        const auto leecher_handle = leecher.add_torrent(std::move(add), error);
+        expect(!error && leecher_handle.is_valid(), "cannot add limited-seeding leecher");
+
+        const auto completed = wait_for_state(restored, id, "completed");
+        expect(completed.at("seedStopReason") == "ratio",
+            "limited seeding did not stop on the ratio condition");
+        expect(completed.at("shareRatio").get<double>() >= 0.1,
+            "reported share ratio did not reach the configured limit");
+        const auto uploaded_before_restart = completed.at("uploadedBytes").get<std::uint64_t>();
+        restored.dispatch("engine.shutdown", nlohmann::json::object());
+
+        bt::Engine verified([](const std::string&, const nlohmann::json&) {});
+        verified.dispatch("engine.initialize", {
+            {"protocolVersion", "1.1"}, {"statePath", path_utf8(seeding_state_path)}});
+        const auto recovered = verified.dispatch("task.get", {{"id", id}}).at("task");
+        expect(recovered.at("state") == "completed" && recovered.at("seedStopReason") == "ratio",
+            "completed seeding state was not restored");
+        expect(recovered.at("uploadedBytes").get<std::uint64_t>() >= uploaded_before_restart,
+            "persistent uploaded byte counter moved backwards after restart");
+        verified.dispatch("engine.shutdown", nlohmann::json::object());
+    }
+}
+
 } // namespace
 
 int main(int argc, char* argv[]) {
@@ -717,6 +899,7 @@ int main(int argc, char* argv[]) {
             return run_recovery_child(argv[2], argv[3], argv[4], argv[5]);
         }
         run_download_integration_test();
+        run_tracker_and_seeding_integration_test();
         std::cout << "Local tracker/seeder integration test passed\n";
         return 0;
     } catch (const std::exception& exception) {

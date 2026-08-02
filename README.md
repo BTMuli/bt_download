@@ -9,6 +9,8 @@
 - info-hash + 规范化保存路径去重；
 - 下载目录可写检查和种子内部路径穿越检查；
 - 全局并发、速度和连接数限制；
+- 公共任务补充 Tracker 的校验、动态替换与私有种子隔离；
+- 按分享率或时间先到即停的限量做种以及跨重启累计；
 - 本地任务目录与 fast-resume 恢复、稳定错误模型和单调事件序号；
 - Windows x64 Debug/Release 构建与协议/状态机/路径单元测试。
 
@@ -40,7 +42,7 @@ Windows Release 发布前应运行独立进程资源基准，采集空闲 CPU/�
 进程启动后先输出 `event.ready`。客户端随后初始化：
 
 ```json
-{"jsonrpc":"2.0","id":"1","method":"engine.initialize","params":{"protocolVersion":"1.0","statePath":"C:\\Users\\me\\AppData\\Local\\BangumiToday\\bt_download"}}
+{"jsonrpc":"2.0","id":"1","method":"engine.initialize","params":{"protocolVersion":"1.1","statePath":"C:\\Users\\me\\AppData\\Local\\BangumiToday\\bt_download"}}
 ```
 
 添加任务：

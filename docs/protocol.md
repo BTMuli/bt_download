@@ -1,13 +1,13 @@
 # bt_download 本地调用契约
 
-协议版本：`1.0`。传输为继承的 stdin/stdout 管道，编码为 UTF-8，每个 JSON-RPC 2.0 对象独占一行。单帧最大 1 MiB。客户端必须同时持续读取 stdout 和 stderr；stdout 不包含日志。
+协议版本：`1.1`。传输为继承的 stdin/stdout 管道，编码为 UTF-8，每个 JSON-RPC 2.0 对象独占一行。单帧最大 1 MiB。客户端必须同时持续读取 stdout 和 stderr；stdout 不包含日志。
 
-> Tracker 补充、限量做种和 `seeding` 状态属于拟议的 `1.1` 扩展，尚未由当前实现提供。完整语义见 [tracker-and-seeding.md](tracker-and-seeding.md)，不能按本文的 `1.0` 已实现能力使用。
+引擎接受 `1.0` 客户端，但该会话不能配置补充 Tracker 和限量做种，因而不会向旧客户端发送 `seeding` 状态。如果持久状态已经启用 `1.1` 能力，旧客户端初始化将返回 `PROTOCOL_MISMATCH`，避免静默终止正在做种的任务。高于引擎次版本或主版本不同的客户端同样返回该错误。
 
 ## 生命周期
 
 1. 客户端启动 `bt_download.exe`。
-2. 引擎发出 `event.ready`。
+2. 引擎发出 `event.ready`，其中包含协议版本、引擎版本和 `features`。
 3. 客户端调用 `engine.initialize`，传入 `protocolVersion`、绝对 `statePath` 和可选 `config`。
 4. 客户端先调用 `task.list` 获取事实快照，再消费增量事件。
 5. 退出时调用 `engine.shutdown`；引擎持久化后回复并退出。
@@ -18,7 +18,7 @@
 | --- | --- | --- |
 | `engine.initialize` | `protocolVersion`, `statePath` | 初始化会话并恢复目录 |
 | `engine.status` | - | 版本、运行时间、统计和配置 |
-| `engine.configure` | 配置字段 | 运行时更新并持久化资源限制 |
+| `engine.configure` | 配置字段 | 运行时更新并持久化资源限制、补充 Tracker 和做种策略 |
 | `engine.shutdown` | - | 保存、停止并退出 |
 | `task.add` | `source`, `savePath` | 添加 torrentFile 或 magnet |
 | `task.list` | - | 返回全量快照与当前事件序号 |
@@ -34,11 +34,9 @@
 {"kind":"magnet","uri":"magnet:?xt=urn:btih:..."}
 ```
 
-配置字段以字节/秒、秒和计数为单位：`activeDownloads`、`downloadRateLimit`、`uploadRateLimit`、`connectionsLimit`、`connectionsPerTask`、`metadataTimeoutSeconds`。速率 `0` 表示不限速；Magnet 元数据超时默认 300 秒，取值范围为 1 至 86400 秒。
+配置字段以字节/秒、秒、分钟和计数为单位：`activeDownloads`、`downloadRateLimit`、`uploadRateLimit`、`connectionsLimit`、`connectionsPerTask`、`metadataTimeoutSeconds`、`additionalTrackers`、`seedingEnabled`、`seedRatioLimit`、`seedTimeLimitMinutes`。速率 `0` 表示不限速；Magnet 元数据超时默认 300 秒，取值范围为 1 至 86400 秒。
 
-## 拟议的 `1.1` 扩展
-
-`engine.initialize` 的 `config` 和 `engine.configure` 拟新增：
+Tracker 与做种配置示例：
 
 ```json
 {
@@ -54,9 +52,9 @@
 - 分享率与时间条件同时启用时，任一条件先满足即停止；
 - 配置整体验证并原子生效，非法配置返回 `INVALID_CONFIG`；
 - 任务状态新增 `seeding`，快照新增 `uploadedBytes`、`shareRatio`、`seedingSeconds`、`seedRatioLimit`、`seedTimeLimitMinutes` 和 `seedStopReason`；
-- 文件可用通知发生在完整性校验完成时，不等待做种结束。
+- 文件完整性校验完成后，状态直接转为 `seeding`，或在禁用/已满足限制时转为 `completed`；客户端可据此发送文件可用通知，不应等待做种结束。
 
-`1.1` 的 Tracker 列表源、自动更新时间和最后同步错误由 BangumiToday 管理，不通过本地引擎协议传输。
+Tracker 列表源、自动更新时间和最后同步错误由 BangumiToday 管理，不通过本地引擎协议传输。引擎未收到 `seedingEnabled` 时使用安全默认值 `false`；BangumiToday `1.1` 客户端负责在新安装且用户已确认提示后显式传入产品默认值 `true`、`2.0` 和 `60`。
 
 ## 错误
 

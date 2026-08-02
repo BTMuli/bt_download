@@ -3,9 +3,12 @@
 #include "bt_download/path_safety.hpp"
 #include "bt_download/protocol.hpp"
 #include "error_mapping.hpp"
+#include "seeding_policy.hpp"
+#include "tracker_config.hpp"
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <fstream>
 #include <iomanip>
 #include <random>
@@ -15,6 +18,7 @@
 
 #include <libtorrent/add_torrent_params.hpp>
 #include <libtorrent/alert_types.hpp>
+#include <libtorrent/announce_entry.hpp>
 #include <libtorrent/download_priority.hpp>
 #include <libtorrent/error_code.hpp>
 #include <libtorrent/magnet_uri.hpp>
@@ -62,10 +66,10 @@ std::string hash_string(const lt::info_hash_t& hashes) {
 }
 
 TaskState state_from_status(const lt::torrent_status& status) {
-    if (status.state == lt::torrent_status::finished || status.state == lt::torrent_status::seeding) {
-        return TaskState::completed;
-    }
     if ((status.flags & lt::torrent_flags::paused) != lt::torrent_flags_t{}) return TaskState::paused;
+    if (status.state == lt::torrent_status::finished || status.state == lt::torrent_status::seeding) {
+        return TaskState::seeding;
+    }
     switch (status.state) {
     case lt::torrent_status::checking_files:
     case lt::torrent_status::checking_resume_data:
@@ -90,30 +94,31 @@ bool replace_file(const std::filesystem::path& temporary, const std::filesystem:
 #endif
 }
 
-void validate_config(const nlohmann::json& config) {
-    const int active = config.value("activeDownloads", 2);
-    const int connections = config.value("connectionsLimit", 200);
-    const int per_task = config.value("connectionsPerTask", 80);
-    const std::int64_t download_limit = config.value("downloadRateLimit", std::int64_t{0});
-    const std::int64_t upload_limit = config.value("uploadRateLimit", std::int64_t{1024 * 1024});
-    const int metadata_timeout = config.value("metadataTimeoutSeconds", 300);
-    if (active < 1 || active > 64) fail(-32602, "INVALID_CONFIG", "activeDownloads must be between 1 and 64");
-    if (connections < 1 || connections > 10000 || per_task < 1 || per_task > connections) {
-        fail(-32602, "INVALID_CONFIG", "connection limits are invalid");
+std::pair<int, int> parse_protocol_version(std::string_view version) {
+    const auto separator = version.find('.');
+    if (separator == std::string_view::npos || separator == 0 || separator + 1 >= version.size()) {
+        throw std::invalid_argument("protocolVersion must use major.minor format");
     }
-    if (download_limit < 0 || upload_limit < 0) fail(-32602, "INVALID_CONFIG", "rate limits cannot be negative");
-    if (metadata_timeout < 1 || metadata_timeout > 86400) {
-        fail(-32602, "INVALID_CONFIG", "metadataTimeoutSeconds must be between 1 and 86400");
+    int major = 0;
+    int minor = 0;
+    const auto major_result = std::from_chars(version.data(), version.data() + separator, major);
+    const auto minor_result = std::from_chars(version.data() + separator + 1, version.data() + version.size(), minor);
+    if (major_result.ec != std::errc{} || major_result.ptr != version.data() + separator
+        || minor_result.ec != std::errc{} || minor_result.ptr != version.data() + version.size()
+        || major < 0 || minor < 0) {
+        throw std::invalid_argument("protocolVersion must use numeric major.minor format");
     }
+    return {major, minor};
 }
 
-lt::settings_pack make_settings(const nlohmann::json& config) {
+lt::settings_pack make_settings(const EngineConfig& config) {
     lt::settings_pack settings;
-    settings.set_int(lt::settings_pack::active_downloads, config.value("activeDownloads", 2));
-    settings.set_int(lt::settings_pack::active_limit, config.value("activeDownloads", 2));
-    settings.set_int(lt::settings_pack::connections_limit, config.value("connectionsLimit", 200));
-    settings.set_int(lt::settings_pack::download_rate_limit, config.value("downloadRateLimit", 0));
-    settings.set_int(lt::settings_pack::upload_rate_limit, config.value("uploadRateLimit", 1024 * 1024));
+    settings.set_int(lt::settings_pack::active_downloads, config.active_downloads);
+    settings.set_int(lt::settings_pack::active_limit, -1);
+    settings.set_int(lt::settings_pack::active_seeds, -1);
+    settings.set_int(lt::settings_pack::connections_limit, config.connections_limit);
+    settings.set_int(lt::settings_pack::download_rate_limit, static_cast<int>(config.download_rate_limit));
+    settings.set_int(lt::settings_pack::upload_rate_limit, static_cast<int>(config.upload_rate_limit));
     const auto alert_mask = lt::alert_category::error | lt::alert_category::storage;
     settings.set_int(lt::settings_pack::alert_mask, static_cast<int>(static_cast<std::uint32_t>(alert_mask)));
     settings.set_bool(lt::settings_pack::enable_dht, true);
@@ -124,20 +129,17 @@ lt::settings_pack make_settings(const nlohmann::json& config) {
     return settings;
 }
 
-void apply_local_rate_limits(lt::session& session, const nlohmann::json& config) {
+void apply_local_rate_limits(lt::session& session, const EngineConfig& config) {
     auto local = session.get_peer_class(lt::session::local_peer_class_id);
-    local.download_limit = config.value("downloadRateLimit", 0);
-    local.upload_limit = config.value("uploadRateLimit", 1024 * 1024);
+    local.download_limit = static_cast<int>(config.download_rate_limit);
+    local.upload_limit = static_cast<int>(config.upload_rate_limit);
     session.set_peer_class(lt::session::local_peer_class_id, local);
 }
 
 } // namespace
 
 Engine::Engine(EventSink event_sink)
-    : event_sink_(std::move(event_sink)),
-      config_({{"activeDownloads", 2}, {"downloadRateLimit", 0}, {"uploadRateLimit", 1024 * 1024},
-               {"connectionsLimit", 200}, {"connectionsPerTask", 80}, {"metadataTimeoutSeconds", 300}}),
-      started_at_(std::chrono::steady_clock::now()),
+    : event_sink_(std::move(event_sink)), started_at_(std::chrono::steady_clock::now()),
       next_resume_save_(started_at_ + resume_save_interval) {}
 
 Engine::~Engine() {
@@ -177,7 +179,14 @@ nlohmann::json Engine::initialize(const nlohmann::json& params) {
     std::scoped_lock lock(mutex_);
     if (initialized_) fail(-32000, "ALREADY_INITIALIZED", "engine is already initialized");
     const auto protocol = params.value("protocolVersion", std::string{});
-    if (protocol.empty() || protocol.substr(0, protocol.find('.')) != std::string(BT_DOWNLOAD_PROTOCOL_VERSION).substr(0, 1)) {
+    try {
+        const auto [client_major, client_minor] = parse_protocol_version(protocol);
+        const auto [engine_major, engine_minor] = parse_protocol_version(BT_DOWNLOAD_PROTOCOL_VERSION);
+        if (client_major != engine_major || client_minor > engine_minor) {
+            fail(-32000, "PROTOCOL_MISMATCH", "unsupported protocol version");
+        }
+        protocol_v1_1_features_ = client_minor >= 1;
+    } catch (const std::invalid_argument&) {
         fail(-32000, "PROTOCOL_MISMATCH", "unsupported protocol version");
     }
     const auto raw_state_path = params.at("statePath").get<std::string>();
@@ -187,16 +196,52 @@ nlohmann::json Engine::initialize(const nlohmann::json& params) {
     std::filesystem::create_directories(state_path_, error);
     if (error) fail(-32000, "STATE_PATH_UNAVAILABLE", "cannot create statePath: " + error.message());
 
-    if (params.contains("config")) config_.update(params["config"]);
-    validate_config(config_);
+    const bool has_initial_config = params.contains("config");
+    if (has_initial_config) {
+        if (!protocol_v1_1_features_
+            && (params["config"].contains("additionalTrackers")
+                || params["config"].contains("seedingEnabled")
+                || params["config"].contains("seedRatioLimit")
+                || params["config"].contains("seedTimeLimitMinutes"))) {
+            fail(-32000, "PROTOCOL_MISMATCH", "Tracker and seeding settings require protocol 1.1");
+        }
+        try {
+            config_ = apply_config_patch(config_, params["config"]);
+        } catch (const std::invalid_argument& exception) {
+            fail(-32602, "INVALID_CONFIG", exception.what());
+        }
+    }
     session_ = std::make_unique<lt::session>(make_settings(config_));
     apply_local_rate_limits(*session_, config_);
     initialized_ = true;
-    load_catalog_locked();
+    if (load_catalog_locked()) {
+        handles_.clear();
+        tasks_.clear();
+        session_.reset();
+        initialized_ = false;
+        fail(-32000, "PROTOCOL_MISMATCH", "persisted state requires protocol 1.1");
+    }
+    if (has_initial_config) {
+        try {
+            config_ = apply_config_patch(config_, params["config"]);
+        } catch (const std::invalid_argument& exception) {
+            handles_.clear();
+            tasks_.clear();
+            session_.reset();
+            initialized_ = false;
+            fail(-32602, "INVALID_CONFIG", exception.what());
+        }
+        session_->apply_settings(make_settings(config_));
+        apply_local_rate_limits(*session_, config_);
+        apply_additional_trackers_to_all_locked(false);
+        persist_catalog_locked();
+    }
     next_resume_save_ = std::chrono::steady_clock::now() + resume_save_interval;
     worker_ = std::jthread([this](std::stop_token token) { worker_loop(token); });
     return {{"protocolVersion", BT_DOWNLOAD_PROTOCOL_VERSION}, {"engineVersion", BT_DOWNLOAD_VERSION},
-            {"libtorrentVersion", LIBTORRENT_VERSION}, {"restoredTasks", tasks_.size()}, {"config", config_}};
+            {"libtorrentVersion", LIBTORRENT_VERSION}, {"restoredTasks", tasks_.size()},
+            {"features", nlohmann::json::array({"additionalTrackers", "limitedSeeding"})},
+            {"config", config_json(config_)}};
 }
 
 nlohmann::json Engine::status() const {
@@ -209,20 +254,79 @@ nlohmann::json Engine::status() const {
     const auto uptime = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - started_at_).count();
     return {{"initialized", initialized_}, {"protocolVersion", BT_DOWNLOAD_PROTOCOL_VERSION},
             {"engineVersion", BT_DOWNLOAD_VERSION}, {"libtorrentVersion", LIBTORRENT_VERSION},
-            {"uptimeSeconds", uptime}, {"taskCount", tasks_.size()}, {"activeTasks", active}, {"config", config_}};
+            {"uptimeSeconds", uptime}, {"taskCount", tasks_.size()}, {"activeTasks", active},
+            {"features", nlohmann::json::array({"additionalTrackers", "limitedSeeding"})},
+            {"config", config_json(config_)}};
 }
 
 nlohmann::json Engine::configure(const nlohmann::json& params) {
     std::scoped_lock lock(mutex_);
     require_initialized();
-    auto next = config_;
-    next.update(params);
-    validate_config(next);
-    config_ = std::move(next);
+    if (!protocol_v1_1_features_
+        && (params.contains("additionalTrackers") || params.contains("seedingEnabled")
+            || params.contains("seedRatioLimit") || params.contains("seedTimeLimitMinutes"))) {
+        fail(-32000, "PROTOCOL_MISMATCH", "Tracker and seeding settings require protocol 1.1");
+    }
+    try {
+        config_ = apply_config_patch(config_, params);
+    } catch (const std::invalid_argument& exception) {
+        fail(-32602, "INVALID_CONFIG", exception.what());
+    }
     session_->apply_settings(make_settings(config_));
     apply_local_rate_limits(*session_, config_);
+    apply_additional_trackers_to_all_locked(true);
+    update_snapshots_locked(true);
     persist_catalog_locked();
-    return {{"config", config_}};
+    return {{"config", config_json(config_)}};
+}
+
+bool Engine::effective_seeding_enabled() const noexcept {
+    return protocol_v1_1_features_ && config_.seeding_enabled;
+}
+
+void Engine::apply_additional_trackers_locked(const lt::torrent_handle& handle, bool reannounce) {
+    if (!handle.is_valid()) return;
+    const auto info = handle.torrent_file();
+    if (!info) return;
+
+    auto current = handle.trackers();
+    std::vector<lt::announce_entry> next;
+    next.reserve(current.size() + config_.additional_trackers.size());
+    int highest_tier = -1;
+    std::unordered_set<std::string> urls;
+    constexpr auto client_source = static_cast<std::uint8_t>(lt::announce_entry::source_client);
+    for (auto entry : current) {
+        if ((entry.source & client_source) != 0) {
+            entry.source = static_cast<std::uint8_t>(entry.source & ~client_source);
+            if (entry.source == 0) continue;
+        }
+        highest_tier = std::max(highest_tier, static_cast<int>(entry.tier));
+        urls.insert(entry.url);
+        next.push_back(std::move(entry));
+    }
+
+    if (protocol_v1_1_features_ && !info->priv()) {
+        const auto supplemental_tier = static_cast<std::uint8_t>(std::min(255, highest_tier + 1));
+        for (const auto& url : config_.additional_trackers) {
+            if (!urls.insert(url).second) continue;
+            lt::announce_entry entry(url);
+            entry.tier = supplemental_tier;
+            entry.source = client_source;
+            next.push_back(std::move(entry));
+        }
+    }
+
+    handle.replace_trackers(next);
+    if (reannounce && (handle.flags() & lt::torrent_flags::paused) == lt::torrent_flags_t{}) {
+        handle.force_reannounce();
+    }
+}
+
+void Engine::apply_additional_trackers_to_all_locked(bool reannounce) {
+    for (const auto& [id, handle] : handles_) {
+        apply_additional_trackers_locked(handle, reannounce);
+        request_resume_save_locked(id, false);
+    }
 }
 
 nlohmann::json Engine::add_task(const nlohmann::json& params) {
@@ -275,9 +379,9 @@ nlohmann::json Engine::add_task(const nlohmann::json& params) {
         add.flags &= ~lt::torrent_flags::auto_managed;
     }
     add.save_path = path_utf8(save_validation.normalized);
-    add.max_connections = config_.value("connectionsPerTask", 80);
+    add.max_connections = config_.connections_per_task;
     const bool start = params.value("start", true);
-    if (!start) add.flags |= lt::torrent_flags::paused;
+    add.flags |= lt::torrent_flags::paused;
 
     for (const auto& [id, task] : tasks_) {
         if (task.info_hash == info_hash) {
@@ -292,7 +396,8 @@ nlohmann::json Engine::add_task(const nlohmann::json& params) {
 
     auto handle = session_->add_torrent(std::move(add), error);
     if (error) fail(-32000, "ENGINE_ADD_FAILED", error.message(), true);
-    if (kind == "magnet" && start) handle.resume();
+    apply_additional_trackers_locked(handle, false);
+    if (start) handle.resume();
     TaskSnapshot task;
     task.id = new_task_id();
     task.state = kind == "magnet" && start ? TaskState::metadata : (start ? TaskState::queued : TaskState::paused);
@@ -351,10 +456,12 @@ nlohmann::json Engine::resume_task(const nlohmann::json& params) {
         const auto handle = handles_.find(task.id);
         if (handle == handles_.end()) fail(-32005, "TASK_UNAVAILABLE", "task has no active torrent handle", true);
         task.last_error.reset();
+        bool metadata_available = task.source_kind != "magnet";
         if (task.source_kind == "magnet") {
             if (const auto info = handle->second.torrent_file()) {
                 if (!validate_magnet_metadata_locked(task.id, handle->second, info)) return {{"task", task}};
                 task.state = TaskState::queued;
+                metadata_available = true;
             } else {
                 handle->second.set_flags(lt::torrent_flags::upload_mode);
                 handle->second.unset_flags(lt::torrent_flags::auto_managed);
@@ -364,7 +471,34 @@ nlohmann::json Engine::resume_task(const nlohmann::json& params) {
         } else {
             task.state = TaskState::queued;
         }
-        handle->second.resume();
+        if (metadata_available) {
+            const auto status = handle->second.status();
+            const bool payload_complete = status.state == lt::torrent_status::finished
+                || status.state == lt::torrent_status::seeding;
+            if (payload_complete) {
+                task.uploaded_bytes = static_cast<std::uint64_t>(std::max<std::int64_t>(0, status.all_time_upload));
+                task.total_bytes = static_cast<std::uint64_t>(std::max<std::int64_t>(0, status.total_wanted));
+                task.seeding_seconds = static_cast<std::uint64_t>(std::max<std::int64_t>(0, status.finished_duration.count()));
+                task.share_ratio = task.total_bytes == 0 ? 0.0
+                    : static_cast<double>(task.uploaded_bytes) / static_cast<double>(task.total_bytes);
+                const auto reason = task.seed_stop_reason ? task.seed_stop_reason
+                    : evaluate_seed_stop(effective_seeding_enabled(), config_.seed_ratio_limit,
+                        config_.seed_time_limit_minutes, task.uploaded_bytes, task.total_bytes,
+                        task.seeding_seconds);
+                if (reason) {
+                    task.seed_stop_reason = reason;
+                    task.state = TaskState::completed;
+                    handle->second.pause();
+                } else {
+                    task.state = TaskState::seeding;
+                    handle->second.resume();
+                }
+            } else {
+                handle->second.resume();
+            }
+        } else {
+            handle->second.resume();
+        }
         request_resume_save_locked(task.id, false);
         persist_catalog_locked();
         emit_task("event.taskUpdated", task);
@@ -457,7 +591,8 @@ void Engine::persist_catalog_locked() {
         item["source"] = task.source;
         task_json.push_back(std::move(item));
     }
-    const nlohmann::json catalog = {{"schemaVersion", 1}, {"config", config_}, {"tasks", std::move(task_json)}};
+    const nlohmann::json catalog = {
+        {"schemaVersion", 2}, {"config", config_json(config_)}, {"tasks", std::move(task_json)}};
     const auto target = state_path_ / "catalog.json";
     const auto temporary = state_path_ / "catalog.json.tmp";
     {
@@ -472,23 +607,35 @@ void Engine::persist_catalog_locked() {
     }
 }
 
-void Engine::load_catalog_locked() {
+bool Engine::load_catalog_locked() {
     const auto catalog_path = state_path_ / "catalog.json";
-    if (!std::filesystem::exists(catalog_path)) return;
+    if (!std::filesystem::exists(catalog_path)) return false;
     try {
         std::ifstream input(catalog_path, std::ios::binary);
         const auto catalog = nlohmann::json::parse(input);
-        if (catalog.value("schemaVersion", 0) != 1) return;
+        const int schema_version = catalog.value("schemaVersion", 0);
+        if (schema_version != 1 && schema_version != 2) return false;
         if (catalog.contains("config")) {
-            auto persisted_config = config_;
-            persisted_config.update(catalog["config"]);
-            validate_config(persisted_config);
-            config_ = std::move(persisted_config);
+            config_ = apply_config_patch(config_, catalog["config"]);
+            if (schema_version == 1) {
+                config_.additional_trackers.clear();
+                config_.seeding_enabled = false;
+                config_.seed_ratio_limit = 2.0;
+                config_.seed_time_limit_minutes = 60;
+            }
             session_->apply_settings(make_settings(config_));
+            apply_local_rate_limits(*session_, config_);
+        }
+        if (!protocol_v1_1_features_
+            && (config_.seeding_enabled || !config_.additional_trackers.empty())) {
+            return true;
         }
         for (const auto& item : catalog.value("tasks", nlohmann::json::array())) {
             try {
                 auto task = item.get<TaskSnapshot>();
+                if (schema_version == 1 && task.state == TaskState::completed) {
+                    task.seed_stop_reason = SeedStopReason::disabled;
+                }
                 if (task.source.empty()) {
                     tasks_.emplace(task.id, std::move(task));
                     continue;
@@ -504,7 +651,7 @@ void Engine::load_catalog_locked() {
                 }
                 if (error) throw std::runtime_error(error.message());
                 add.save_path = path_utf8(task.save_path);
-                add.max_connections = config_.value("connectionsPerTask", 80);
+                add.max_connections = config_.connections_per_task;
                 const bool stage_magnet_metadata = task.source_kind == "magnet"
                     && task.state != TaskState::paused && task.state != TaskState::completed
                     && task.state != TaskState::error;
@@ -515,14 +662,13 @@ void Engine::load_catalog_locked() {
                     add.flags |= lt::torrent_flags::upload_mode;
                     add.flags &= ~lt::torrent_flags::auto_managed;
                 }
-                if (task.state == TaskState::paused || task.state == TaskState::completed || task.state == TaskState::error) {
-                    add.flags |= lt::torrent_flags::paused;
-                } else {
-                    add.flags &= ~lt::torrent_flags::paused;
-                }
+                const bool should_resume = task.state != TaskState::paused
+                    && task.state != TaskState::completed && task.state != TaskState::error;
+                add.flags |= lt::torrent_flags::paused;
                 auto handle = session_->add_torrent(std::move(add), error);
                 if (error) throw std::runtime_error(error.message());
-                if (stage_magnet_metadata) handle.resume();
+                apply_additional_trackers_locked(handle, false);
+                if (should_resume) handle.resume();
                 handles_.emplace(task.id, handle);
                 if (stage_magnet_metadata) {
                     metadata_started_.insert_or_assign(task.id, std::chrono::steady_clock::now());
@@ -541,6 +687,7 @@ void Engine::load_catalog_locked() {
         std::error_code error;
         std::filesystem::rename(catalog_path, damaged, error);
     }
+    return false;
 }
 
 void Engine::request_resume_save_locked(const std::string& id, bool only_if_modified) {
@@ -694,6 +841,7 @@ bool Engine::validate_magnet_metadata_locked(const std::string& id,
     task.private_torrent = info->priv();
     if (task.display_name.empty()) task.display_name = info->name();
     task.last_error.reset();
+    apply_additional_trackers_locked(handle, false);
     metadata_started_.erase(id);
     return true;
 }
@@ -782,7 +930,7 @@ bool Engine::update_snapshots_locked(bool emit_events) {
                 catalog_changed = true;
                 continue;
             }
-            const auto timeout = std::chrono::seconds(config_.value("metadataTimeoutSeconds", 300));
+            const auto timeout = std::chrono::seconds(config_.metadata_timeout_seconds);
             if (std::chrono::steady_clock::now() - metadata_started_.at(id) >= timeout) {
                 fail_task_locked(id, "METADATA_TIMEOUT", "timed out while fetching magnet metadata", true);
                 catalog_changed = true;
@@ -792,21 +940,23 @@ bool Engine::update_snapshots_locked(bool emit_events) {
         const auto status = handle.status(lt::torrent_handle::query_name);
         const auto previous_state = task.state;
         const auto previous_downloaded = task.downloaded_bytes;
+        const auto previous_uploaded = task.uploaded_bytes;
+        const auto previous_seeding_seconds = task.seeding_seconds;
         const auto previous_download_rate = task.download_rate;
         const auto previous_upload_rate = task.upload_rate;
         const auto previous_peers = task.peers;
         const auto previous_seeds = task.seeds;
         auto next_state = state_from_status(status);
-        if (task.state == TaskState::error) next_state = TaskState::error;
-        if (status.errc && task.state != TaskState::error) {
-            next_state = TaskState::error;
-            task.last_error = map_libtorrent_error(status.errc, LibtorrentErrorContext::torrent);
-        }
-        const bool state_changed = next_state != previous_state;
-        task.state = next_state;
         task.total_bytes = static_cast<std::uint64_t>(std::max<std::int64_t>(0, status.total_wanted));
         task.downloaded_bytes = static_cast<std::uint64_t>(std::max<std::int64_t>(0, status.total_wanted_done));
         task.verified_bytes = task.downloaded_bytes;
+        task.uploaded_bytes = static_cast<std::uint64_t>(std::max<std::int64_t>(0, status.all_time_upload));
+        task.seeding_seconds = static_cast<std::uint64_t>(
+            std::max<std::int64_t>(0, status.finished_duration.count()));
+        task.share_ratio = task.total_bytes == 0 ? 0.0
+            : static_cast<double>(task.uploaded_bytes) / static_cast<double>(task.total_bytes);
+        task.seed_ratio_limit = config_.seed_ratio_limit;
+        task.seed_time_limit_minutes = config_.seed_time_limit_minutes;
         task.download_rate = static_cast<std::uint64_t>(std::max(0, status.download_payload_rate));
         task.upload_rate = static_cast<std::uint64_t>(std::max(0, status.upload_payload_rate));
         task.peers = status.num_peers;
@@ -814,12 +964,36 @@ bool Engine::update_snapshots_locked(bool emit_events) {
         if (task.display_name.empty()) task.display_name = status.name;
         if (task.info_hash.empty()) task.info_hash = hash_string(status.info_hashes);
         if (const auto info = handle.torrent_file()) task.private_torrent = info->priv();
-        if (task.state == TaskState::completed && previous_state != TaskState::completed) {
+
+        if (task.state == TaskState::error) next_state = TaskState::error;
+        else if (status.errc) {
+            next_state = TaskState::error;
+            task.last_error = map_libtorrent_error(status.errc, LibtorrentErrorContext::torrent);
+        } else if (task.seed_stop_reason && next_state != TaskState::checking) {
+            next_state = TaskState::completed;
+        } else if (previous_state == TaskState::completed && next_state != TaskState::checking) {
+            next_state = TaskState::completed;
+        } else if (next_state == TaskState::seeding) {
+            if (const auto reason = evaluate_seed_stop(effective_seeding_enabled(), config_.seed_ratio_limit,
+                    config_.seed_time_limit_minutes, task.uploaded_bytes, task.total_bytes,
+                    task.seeding_seconds)) {
+                task.seed_stop_reason = reason;
+                next_state = TaskState::completed;
+            }
+        }
+
+        const bool state_changed = next_state != previous_state;
+        task.state = next_state;
+        if (task.state == TaskState::completed
+            && (previous_state != TaskState::completed
+                || (handle.flags() & lt::torrent_flags::paused) == lt::torrent_flags_t{})) {
             handle.pause();
             task.download_rate = 0;
             task.upload_rate = 0;
         }
         const bool progress_changed = previous_downloaded != task.downloaded_bytes
+            || previous_uploaded != task.uploaded_bytes
+            || previous_seeding_seconds != task.seeding_seconds
             || previous_download_rate != task.download_rate || previous_upload_rate != task.upload_rate
             || previous_peers != task.peers || previous_seeds != task.seeds;
         if (state_changed || progress_changed) {

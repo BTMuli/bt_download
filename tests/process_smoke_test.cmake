@@ -13,7 +13,7 @@ file(MAKE_DIRECTORY "${absolute_state_path}")
 
 set(input_path "${absolute_state_path}/requests.ndjson")
 file(WRITE "${input_path}"
-    "{\"jsonrpc\":\"2.0\",\"id\":\"init\",\"method\":\"engine.initialize\",\"params\":{\"protocolVersion\":\"1.0\",\"statePath\":\"${json_state_path}\"}}\n"
+    "{\"jsonrpc\":\"2.0\",\"id\":\"init\",\"method\":\"engine.initialize\",\"params\":{\"protocolVersion\":\"1.1\",\"statePath\":\"${json_state_path}\"}}\n"
     "{\"jsonrpc\":\"2.0\",\"id\":\"stop\",\"method\":\"engine.shutdown\"}\n"
 )
 
@@ -36,6 +36,9 @@ endif()
 
 if(NOT protocol_output MATCHES "\"method\":\"event.ready\"")
     message(FATAL_ERROR "event.ready was not emitted: ${protocol_output}")
+endif()
+if(NOT protocol_output MATCHES "\"protocolVersion\":\"1.1\"")
+    message(FATAL_ERROR "protocol 1.1 was not advertised: ${protocol_output}")
 endif()
 if(NOT protocol_output MATCHES "\"id\":\"init\"[^\n]*\"result\"")
     message(FATAL_ERROR "initialize response was not emitted: ${protocol_output}")

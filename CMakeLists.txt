@@ -24,11 +24,14 @@ find_package(LibtorrentRasterbar CONFIG REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
 
 add_library(bt_download_core
+    src/config.cpp
     src/engine.cpp
     src/error_mapping.cpp
     src/path_safety.cpp
     src/protocol.cpp
+    src/seeding_policy.cpp
     src/task.cpp
+    src/tracker_config.cpp
 )
 target_include_directories(bt_download_core PUBLIC include)
 target_compile_features(bt_download_core PUBLIC cxx_std_20)
@@ -39,7 +42,7 @@ target_link_libraries(bt_download_core
 )
 target_compile_definitions(bt_download_core PUBLIC
     BT_DOWNLOAD_VERSION="${PROJECT_VERSION}"
-    BT_DOWNLOAD_PROTOCOL_VERSION="1.0"
+    BT_DOWNLOAD_PROTOCOL_VERSION="1.1"
     _WIN32_WINNT=0x0A00
 )
 if(MSVC)
@@ -108,6 +111,7 @@ endif()
 if(BT_DOWNLOAD_BUILD_TESTS)
     enable_testing()
     add_executable(bt_download_tests
+        tests/config_test.cpp
         tests/test_main.cpp
         tests/error_mapping_test.cpp
         tests/magnet_metadata_test.cpp

@@ -11,7 +11,9 @@ int main() {
     bt::ProtocolServer server(std::cin, std::cout, std::cerr,
         [&engine](const std::string& method, const nlohmann::json& params) { return engine.dispatch(method, params); });
     protocol = &server;
-    server.send_event("event.ready", {{"protocolVersion", BT_DOWNLOAD_PROTOCOL_VERSION}, {"engineVersion", BT_DOWNLOAD_VERSION}});
+    server.send_event("event.ready", {
+        {"protocolVersion", BT_DOWNLOAD_PROTOCOL_VERSION}, {"engineVersion", BT_DOWNLOAD_VERSION},
+        {"features", nlohmann::json::array({"additionalTrackers", "limitedSeeding"})}});
     const int result = server.run();
     if (!engine.shutdown_requested()) engine.dispatch("engine.shutdown", nlohmann::json::object());
     return result;

@@ -15,9 +15,9 @@
 
 - [x] `.torrent` 绝对路径和 Magnet URI；
 - [x] UUID 任务 ID、同一 info-hash 会话级去重（避免 libtorrent 将不同保存路径静默别名到同一 handle）；
-- [x] metadata/checking/queued/downloading/paused/completed/error 状态；
+- [x] metadata/checking/queued/downloading/seeding/paused/completed/error 状态；
 - [x] 500 ms 聚合进度事件（普通进度最多 2 次/秒）和单调序号；
-- [x] 完成后立即暂停，默认不继续做种；
+- [x] 协议 `1.0` 或未显式启用做种时完成后立即暂停；协议 `1.1` 可执行限量做种；
 - [x] 删除任务默认保留数据，删除数据必须显式传入 `deleteData`；
 - [x] 保存目录绝对路径/存在性/可写性检查；
 - [x] 种子内部绝对路径、盘符和 `..` 穿越拦截；
@@ -47,15 +47,15 @@
 - [x] Flutter Release/MSIX 构建接入与伴随进程产物完整性校验；
 - [ ] 侧载/升级 MSIX 和 Microsoft Store 包实机验证。
 
-## 第 5 步：Tracker 与限量做种（需求已定义，待实现）
+## 第 5 步：Tracker 与限量做种（引擎已实现，主应用待接入）
 
-- [ ] 协议升级到 `1.1`，配置支持 `additionalTrackers`、`seedingEnabled`、`seedRatioLimit` 和 `seedTimeLimitMinutes`；
-- [ ] Tracker URL 二次校验、去重、来源标记和运行时动态应用；
-- [ ] 公共 `.torrent`/Magnet 补充 Tracker，私有种子与属性未知 Magnet 的防泄露测试；
-- [ ] `seeding` 状态、累计上传/做种时间、停止条件与停止原因；
-- [ ] 做种计数的 fast-resume 持久化以及暂停、崩溃、重启恢复测试；
-- [ ] 下载完成通知与做种结束状态分离，做种任务不占活动下载槽；
+- [x] 协议升级到 `1.1`，配置支持 `additionalTrackers`、`seedingEnabled`、`seedRatioLimit` 和 `seedTimeLimitMinutes`；
+- [x] Tracker URL 二次校验、去重、来源标记和运行时动态应用；
+- [x] 公共 `.torrent`/Magnet 补充 Tracker，私有种子与属性未知 Magnet 的防泄露测试；
+- [x] `seeding` 状态、累计上传/做种时间、停止条件与停止原因；
+- [x] 做种计数的 fast-resume 持久化以及暂停、崩溃、重启恢复测试；
+- [x] 文件可用与做种结束状态分离，做种任务不占活动下载槽；
 - [ ] BangumiToday 完成列表源同步、最后成功快照、自动更新和设置页接入；
-- [ ] 协议 `1.0` 配置迁移保持完成即停止，新安装采用分享率 `2.0` 或 `60` 分钟默认策略。
+- [x] 协议 `1.0`/catalog schema 1 迁移保持完成即停止；新安装默认值由 BangumiToday `1.1` 客户端显式下发。
 
 专项需求、边界和验收用例见 [tracker-and-seeding.md](tracker-and-seeding.md)。下一阶段还应在侧载、升级安装和 Store 包实机环境下验证进程启动、父进程强制结束监管与状态恢复。

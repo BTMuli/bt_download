@@ -65,6 +65,67 @@ std::filesystem::path create_test_torrent(const std::filesystem::path& directory
 
 void run_resume_data_tests() {
     TemporaryDirectory temporary;
+    {
+        bt::Engine engine([](const std::string&, const nlohmann::json&) {});
+        bool rejected = false;
+        try {
+            engine.dispatch("engine.initialize", {
+                {"protocolVersion", "1.-1"},
+                {"statePath", path_utf8(temporary.path() / "invalid-protocol-state")}});
+        } catch (const std::exception& exception) {
+            rejected = std::string(exception.what()).find("unsupported protocol version")
+                != std::string::npos;
+        }
+        expect(rejected, "negative protocol minor version was accepted");
+    }
+
+    const auto legacy_state_path = temporary.path() / "legacy-state";
+    std::filesystem::create_directories(legacy_state_path);
+    {
+        std::ofstream legacy_catalog(legacy_state_path / "catalog.json", std::ios::binary | std::ios::trunc);
+        legacy_catalog << nlohmann::json({
+            {"schemaVersion", 1}, {"config", {{"activeDownloads", 3}}},
+            {"tasks", nlohmann::json::array()},
+        }).dump(2);
+    }
+    {
+        bt::Engine engine([](const std::string&, const nlohmann::json&) {});
+        const auto initialized = engine.dispatch("engine.initialize", {
+            {"protocolVersion", "1.1"}, {"statePath", path_utf8(legacy_state_path)}});
+        expect(initialized.at("config").at("seedingEnabled") == false,
+            "schema 1 migration silently enabled seeding");
+        expect(initialized.at("config").at("additionalTrackers").empty(),
+            "schema 1 migration invented supplemental Trackers");
+        engine.dispatch("engine.shutdown", nlohmann::json::object());
+    }
+    {
+        std::ifstream migrated_catalog(legacy_state_path / "catalog.json", std::ios::binary);
+        const auto migrated = nlohmann::json::parse(migrated_catalog);
+        expect(migrated.at("schemaVersion") == 2, "schema 1 catalog was not migrated to schema 2");
+    }
+
+    const auto protocol_1_1_state_path = temporary.path() / "protocol-1-1-state";
+    {
+        bt::Engine engine([](const std::string&, const nlohmann::json&) {});
+        engine.dispatch("engine.initialize", {
+            {"protocolVersion", "1.1"}, {"statePath", path_utf8(protocol_1_1_state_path)},
+            {"config", {{"seedingEnabled", true}, {"seedRatioLimit", 2.0},
+                {"seedTimeLimitMinutes", 60}}}});
+        engine.dispatch("engine.shutdown", nlohmann::json::object());
+    }
+    {
+        bt::Engine engine([](const std::string&, const nlohmann::json&) {});
+        bool rejected = false;
+        try {
+            engine.dispatch("engine.initialize", {
+                {"protocolVersion", "1.0"}, {"statePath", path_utf8(protocol_1_1_state_path)}});
+        } catch (const std::exception& exception) {
+            rejected = std::string(exception.what()).find("persisted state requires protocol 1.1")
+                != std::string::npos;
+        }
+        expect(rejected, "protocol 1.0 silently accepted persisted protocol 1.1 settings");
+    }
+
     const auto state_path = temporary.path() / "state";
     const auto save_path = temporary.path() / "downloads";
     std::filesystem::create_directories(save_path);

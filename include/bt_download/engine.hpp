@@ -1,5 +1,6 @@
 #pragma once
 
+#include "bt_download/config.hpp"
 #include "bt_download/task.hpp"
 
 #include <chrono>
@@ -48,7 +49,7 @@ private:
     void require_initialized() const;
     void finalize_locked();
     void persist_catalog_locked();
-    void load_catalog_locked();
+    bool load_catalog_locked();
     void request_resume_save_locked(const std::string& id, bool only_if_modified);
     void request_periodic_resume_saves_locked();
     void process_alerts_locked();
@@ -56,6 +57,9 @@ private:
     bool validate_magnet_metadata_locked(const std::string& id,
         const libtorrent::torrent_handle& handle,
         const std::shared_ptr<const libtorrent::torrent_info>& info);
+    void apply_additional_trackers_locked(const libtorrent::torrent_handle& handle, bool reannounce);
+    void apply_additional_trackers_to_all_locked(bool reannounce);
+    bool effective_seeding_enabled() const noexcept;
     void fail_task_locked(const std::string& id, std::string code, std::string message, bool retryable);
     bool load_resume_data_locked(const TaskSnapshot& task, libtorrent::add_torrent_params& add);
     void write_resume_data_locked(const std::string& id, const libtorrent::add_torrent_params& add);
@@ -76,13 +80,14 @@ private:
     std::unordered_set<std::string> pending_task_updates_;
     std::unordered_map<std::string, std::chrono::steady_clock::time_point> metadata_started_;
     std::filesystem::path state_path_;
-    nlohmann::json config_;
+    EngineConfig config_;
     std::chrono::steady_clock::time_point started_at_;
     std::chrono::steady_clock::time_point next_resume_save_;
     std::uint64_t sequence_{0};
     std::jthread worker_;
     bool initialized_{false};
     bool shutdown_requested_{false};
+    bool protocol_v1_1_features_{false};
 };
 
 } // namespace bt
