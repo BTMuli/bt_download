@@ -25,6 +25,7 @@ find_package(nlohmann_json CONFIG REQUIRED)
 
 add_library(bt_download_core
     src/engine.cpp
+    src/error_mapping.cpp
     src/path_safety.cpp
     src/protocol.cpp
     src/task.cpp
@@ -108,6 +109,7 @@ if(BT_DOWNLOAD_BUILD_TESTS)
     enable_testing()
     add_executable(bt_download_tests
         tests/test_main.cpp
+        tests/error_mapping_test.cpp
         tests/magnet_metadata_test.cpp
         tests/path_safety_test.cpp
         tests/protocol_test.cpp
@@ -115,6 +117,7 @@ if(BT_DOWNLOAD_BUILD_TESTS)
         tests/task_test.cpp
     )
     target_link_libraries(bt_download_tests PRIVATE bt_download_core)
+    target_include_directories(bt_download_tests PRIVATE src)
     add_test(NAME bt_download_tests COMMAND bt_download_tests)
 
     add_test(NAME bt_download_process_smoke_test

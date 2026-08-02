@@ -2,6 +2,7 @@
 
 #include "bt_download/path_safety.hpp"
 #include "bt_download/protocol.hpp"
+#include "error_mapping.hpp"
 
 #include <algorithm>
 #include <array>
@@ -607,6 +608,20 @@ void Engine::process_alerts_locked() {
                 }
             }
             if (deferred_resume_saves_.erase(*id) != 0) request_resume_save_locked(*id, false);
+            continue;
+        }
+        if (const auto* failed = lt::alert_cast<lt::file_error_alert>(alert)) {
+            const auto id = task_id_for_handle_locked(failed->handle);
+            if (!id || tasks_.at(*id).state == TaskState::error) continue;
+            const auto mapped = map_libtorrent_error(failed->error, LibtorrentErrorContext::storage);
+            fail_task_locked(*id, mapped.code, mapped.message, mapped.retryable);
+            continue;
+        }
+        if (const auto* failed = lt::alert_cast<lt::torrent_error_alert>(alert)) {
+            const auto id = task_id_for_handle_locked(failed->handle);
+            if (!id || tasks_.at(*id).state == TaskState::error) continue;
+            const auto mapped = map_libtorrent_error(failed->error, LibtorrentErrorContext::torrent);
+            fail_task_locked(*id, mapped.code, mapped.message, mapped.retryable);
         }
     }
 }
@@ -783,9 +798,9 @@ bool Engine::update_snapshots_locked(bool emit_events) {
         const auto previous_seeds = task.seeds;
         auto next_state = state_from_status(status);
         if (task.state == TaskState::error) next_state = TaskState::error;
-        if (status.errc) {
+        if (status.errc && task.state != TaskState::error) {
             next_state = TaskState::error;
-            task.last_error = TaskError{"TORRENT_ERROR", status.errc.message(), true};
+            task.last_error = map_libtorrent_error(status.errc, LibtorrentErrorContext::torrent);
         }
         const bool state_changed = next_state != previous_state;
         task.state = next_state;
