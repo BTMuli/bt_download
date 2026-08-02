@@ -1,7 +1,7 @@
 # Tracker 与限量做种需求
 
-> 状态：部分实现（引擎已完成，主应用待接入）
-> 目标协议：`1.1`（引擎已实现，BangumiToday 主应用待接入）
+> 状态：已实现（待发布环境验证）
+> 目标协议：`1.1`（引擎与 BangumiToday 主应用均已接入）
 > 适用范围：BangumiToday 设置页、`BtEngineClient` 与 `bt_download` 伴随进程
 
 ## 1. 结论
@@ -15,7 +15,7 @@
 - 升级安装保持既有“完成即停止”行为，直到用户确认新的做种设置，避免升级后静默增加上传流量；
 - 下载完成与做种结束是两个事件：文件校验完成即可通知用户，随后任务可进入 `seeding`，最终才进入 `completed`。
 
-本文定义完整的产品与协议语义；引擎部分已经实现，BangumiToday 设置、同步与提示仍待接入。逐项状态见 [implementation.md](implementation.md)。
+本文定义完整的产品与协议语义；引擎以及 BangumiToday 设置、同步、迁移与提示均已实现。发布环境验证状态见 [implementation.md](implementation.md)。
 
 ## 2. Motrix 参考与取舍
 

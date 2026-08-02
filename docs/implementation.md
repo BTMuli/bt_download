@@ -47,7 +47,7 @@
 - [x] Flutter Release/MSIX 构建接入与伴随进程产物完整性校验；
 - [ ] 侧载/升级 MSIX 和 Microsoft Store 包实机验证。
 
-## 第 5 步：Tracker 与限量做种（引擎已实现，主应用待接入）
+## 第 5 步：Tracker 与限量做种（已完成）
 
 - [x] 协议升级到 `1.1`，配置支持 `additionalTrackers`、`seedingEnabled`、`seedRatioLimit` 和 `seedTimeLimitMinutes`；
 - [x] Tracker URL 二次校验、去重、来源标记和运行时动态应用；
@@ -55,7 +55,7 @@
 - [x] `seeding` 状态、累计上传/做种时间、停止条件与停止原因；
 - [x] 做种计数的 fast-resume 持久化以及暂停、崩溃、重启恢复测试；
 - [x] 文件可用与做种结束状态分离，做种任务不占活动下载槽；
-- [ ] BangumiToday 完成列表源同步、最后成功快照、自动更新和设置页接入；
+- [x] BangumiToday 完成列表源同步、最后成功快照、自动更新和设置页接入；
 - [x] 协议 `1.0`/catalog schema 1 迁移保持完成即停止；新安装默认值由 BangumiToday `1.1` 客户端显式下发。
 
-专项需求、边界和验收用例见 [tracker-and-seeding.md](tracker-and-seeding.md)。下一阶段还应在侧载、升级安装和 Store 包实机环境下验证进程启动、父进程强制结束监管与状态恢复。
+专项需求、边界和验收用例见 [tracker-and-seeding.md](tracker-and-seeding.md)。下一阶段还应在侧载、升级安装和 Store 包实机环境下验证进程启动、父进程强制结束监管、Tracker 网络策略与状态恢复。
