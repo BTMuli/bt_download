@@ -73,6 +73,10 @@ std::string endpoint_string(const lt::tcp::endpoint& endpoint) {
     return address + ":" + std::to_string(endpoint.port());
 }
 
+int priority_value(lt::download_priority_t priority) {
+    return static_cast<int>(static_cast<std::uint8_t>(priority));
+}
+
 TaskState state_from_status(const lt::torrent_status& status) {
     if ((status.flags & lt::torrent_flags::paused) != lt::torrent_flags_t{}) return TaskState::paused;
     if (status.state == lt::torrent_status::finished || status.state == lt::torrent_status::seeding) {
@@ -171,6 +175,7 @@ nlohmann::json Engine::dispatch(const std::string& method, const nlohmann::json&
     if (method == "task.list") return list_tasks();
     if (method == "task.get") return get_task(params);
     if (method == "task.details") return get_task_details(params);
+    if (method == "task.setFilePriorities") return set_file_priorities(params);
     if (method == "task.pause") return pause_task(params);
     if (method == "task.resume") return resume_task(params);
     if (method == "task.retry") return retry_task(params);
@@ -475,6 +480,13 @@ nlohmann::json Engine::get_task_details(const nlohmann::json& params) {
     details["completedPieces"] = std::move(completed_pieces);
 
     const auto file_progress = handle.file_progress(lt::torrent_handle::piece_granularity);
+    std::vector<lt::download_priority_t> priorities;
+    const auto cached_priorities = file_priorities_.find(id);
+    if (cached_priorities != file_priorities_.end()) {
+        priorities = cached_priorities->second;
+    } else {
+        priorities = handle.get_file_priorities();
+    }
     std::size_t file_count = 0;
     for (const auto index : info->files().file_range()) {
         if (file_count >= max_detail_files) {
@@ -486,10 +498,14 @@ nlohmann::json Engine::get_task_details(const nlohmann::json& params) {
         const auto completed = progress_index < file_progress.size()
             ? std::clamp<std::int64_t>(file_progress[progress_index], 0, size)
             : 0;
+        const auto priority = progress_index < priorities.size()
+            ? priority_value(priorities[progress_index])
+            : priority_value(lt::default_priority);
         details["files"].push_back({
             {"path", info->files().file_path(index)},
             {"size", size},
             {"completedBytes", completed},
+            {"priority", priority},
         });
         ++file_count;
     }
@@ -509,6 +525,86 @@ nlohmann::json Engine::get_task_details(const nlohmann::json& params) {
     }
     details["peersTruncated"] = peers.size() > max_detail_peers;
     return details;
+}
+
+nlohmann::json Engine::set_file_priorities(const nlohmann::json& params) {
+    std::scoped_lock lock(mutex_);
+    require_initialized();
+    const auto id = params.at("id").get<std::string>();
+    const auto found = tasks_.find(id);
+    if (found == tasks_.end()) fail(-32004, "TASK_NOT_FOUND", "task not found");
+    const auto& task = found->second;
+
+    const auto& patch = params.at("priorities");
+    if (!patch.is_object() || patch.empty()) {
+        fail(-32602, "INVALID_FILE_PRIORITY",
+            "priorities must be a non-empty object mapping file indices to priorities");
+    }
+    if (patch.size() > max_detail_files) {
+        fail(-32602, "INVALID_FILE_PRIORITY", "too many file priorities in one request");
+    }
+
+    const auto handle_found = handles_.find(id);
+    if (handle_found == handles_.end() || !handle_found->second.is_valid()) {
+        fail(-32005, "TASK_UNAVAILABLE", "task has no active torrent handle", true);
+    }
+    const auto& handle = handle_found->second;
+    const auto info = handle.torrent_file();
+    if (!info) {
+        fail(-32006, "METADATA_UNAVAILABLE",
+            "file priorities require torrent metadata");
+    }
+    if (task.state == TaskState::completed || task.state == TaskState::seeding) {
+        fail(-32005, "TASK_UNAVAILABLE",
+            "file priorities cannot be changed on a completed or seeding task");
+    }
+
+    const auto file_count = static_cast<std::size_t>(info->num_files());
+    auto& priorities = file_priorities_[id];
+    if (priorities.size() != file_count) {
+        priorities = handle.get_file_priorities();
+        if (priorities.size() != file_count) {
+            priorities.assign(file_count, lt::default_priority);
+        }
+    }
+    for (const auto& [key, value] : patch.items()) {
+        int index = 0;
+        const auto parsed = std::from_chars(key.data(), key.data() + key.size(), index);
+        if (parsed.ec != std::errc{} || parsed.ptr != key.data() + key.size() || index < 0) {
+            fail(-32602, "INVALID_FILE_PRIORITY", "file priority key must be a numeric file index");
+        }
+        const auto file_index = static_cast<std::size_t>(index);
+        if (file_index >= file_count) {
+            fail(-32602, "INVALID_FILE_PRIORITY", "file index out of range");
+        }
+        if (!value.is_number_integer() || value.get<int>() < 0 || value.get<int>() > 7) {
+            fail(-32602, "INVALID_FILE_PRIORITY",
+                "priority must be an integer in the range 0..7");
+        }
+        priorities[file_index] = lt::download_priority_t{
+            static_cast<std::uint8_t>(value.get<int>())};
+    }
+
+    handle.prioritize_files(priorities);
+    // File priorities are applied asynchronously by the disk thread. Wait for
+    // the change to take effect so the immediate resume save and the caller
+    // both observe the applied state.
+    const auto priority_deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(1000);
+    for (;;) {
+        const auto applied = handle.get_file_priorities();
+        if (applied.size() == file_count && applied == priorities) break;
+        if (std::chrono::steady_clock::now() >= priority_deadline) {
+            fail(-32000, "INTERNAL_ERROR", "file priority update did not take effect", true);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    request_resume_save_locked(id, false);
+    nlohmann::json response_priorities = nlohmann::json::array();
+    for (const auto priority : priorities) {
+        response_priorities.push_back(priority_value(priority));
+    }
+    return {{"priorities", std::move(response_priorities)}};
 }
 
 nlohmann::json Engine::pause_task(const nlohmann::json& params) {
@@ -621,6 +717,7 @@ nlohmann::json Engine::remove_task(const nlohmann::json& params) {
     deferred_resume_saves_.erase(id);
     pending_task_updates_.erase(id);
     metadata_started_.erase(id);
+    file_priorities_.erase(id);
     tasks_.erase(id);
     std::error_code resume_error;
     std::filesystem::remove(state_path_ / "resume" / (id + ".fastresume"), resume_error);
@@ -658,6 +755,7 @@ void Engine::finalize_locked() {
     pending_resume_saves_.clear();
     deferred_resume_saves_.clear();
     metadata_started_.clear();
+    file_priorities_.clear();
     handles_.clear();
     session_.reset();
 }
@@ -842,6 +940,11 @@ void Engine::process_alerts_locked() {
             if (!id || tasks_.at(*id).state == TaskState::error) continue;
             const auto mapped = map_libtorrent_error(failed->error, LibtorrentErrorContext::storage);
             fail_task_locked(*id, mapped.code, mapped.message, mapped.retryable);
+            continue;
+        }
+        if (const auto* file_priority = lt::alert_cast<lt::file_prio_alert>(alert)) {
+            const auto id = task_id_for_handle_locked(file_priority->handle);
+            if (id) request_resume_save_locked(*id, false);
             continue;
         }
         if (const auto* failed = lt::alert_cast<lt::torrent_error_alert>(alert)) {

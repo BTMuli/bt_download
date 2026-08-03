@@ -15,9 +15,11 @@ option(BT_DOWNLOAD_BUILD_BENCHMARKS "Build bt_download performance benchmarks" O
 
 # Full automatic inlining under MSVC 19.51 makes several libtorrent/nlohmann-
 # heavy translation units terminate with FAST_FAIL_STACK_COOKIE_CHECK_FAILURE.
-# Retain /O2 while limiting inlining for this toolset generation.
+# Retain /O2 while limiting inlining for this toolset generation. Some
+# translation units still trip the stack-cookie check with /Ob1, so the
+# generation is compiled without inline expansion.
 if(MSVC AND MSVC_VERSION EQUAL 1951)
-    add_compile_options("$<$<CONFIG:Release>:/Ob1>")
+    add_compile_options("$<$<CONFIG:Release>:/Ob0>")
 endif()
 
 find_package(LibtorrentRasterbar CONFIG REQUIRED)
@@ -112,6 +114,7 @@ if(BT_DOWNLOAD_BUILD_TESTS)
     enable_testing()
     add_executable(bt_download_tests
         tests/config_test.cpp
+        tests/file_priority_test.cpp
         tests/test_main.cpp
         tests/error_mapping_test.cpp
         tests/magnet_metadata_test.cpp

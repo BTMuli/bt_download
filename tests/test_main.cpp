@@ -8,6 +8,7 @@ void run_magnet_metadata_tests();
 void run_protocol_tests();
 void run_resume_data_tests();
 void run_task_tests();
+void run_file_priority_tests();
 
 int main() {
     try {
@@ -18,6 +19,7 @@ int main() {
         run_protocol_tests();
         run_resume_data_tests();
         run_task_tests();
+        run_file_priority_tests();
         std::cout << "All tests passed\n";
         return 0;
     } catch (const std::exception& exception) {

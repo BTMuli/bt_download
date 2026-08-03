@@ -564,24 +564,29 @@ void run_download_integration_test() {
     const auto magnet_source = seed_root / "magnet.bin";
     const auto private_source = seed_root / "private.bin";
     const auto recovery_source = seed_root / "recovery.bin";
+    const auto select_source = seed_root / "select";
     write_payload(single_source, 180 * 1024 + 73, 11);
     write_payload(bundle_source / "first.bin", 96 * 1024 + 19, 23);
     write_payload(bundle_source / "nested" / "second.bin", 144 * 1024 + 41, 31);
     write_payload(magnet_source, 192 * 1024 + 29, 47);
     write_payload(private_source, 224 * 1024 + 61, 53);
     write_payload(recovery_source, 4 * 1024 * 1024 + 113, 59);
+    write_payload(select_source / "keep.bin", 128 * 1024 + 7, 61);
+    write_payload(select_source / "skip.bin", 64 * 1024 + 3, 67);
 
     const auto single_torrent_path = temporary.path() / "single.torrent";
     const auto bundle_torrent_path = temporary.path() / "bundle.torrent";
     const auto magnet_torrent_path = temporary.path() / "magnet.torrent";
     const auto private_torrent_path = temporary.path() / "private.torrent";
     const auto recovery_torrent_path = temporary.path() / "recovery.torrent";
+    const auto select_torrent_path = temporary.path() / "select.torrent";
     const auto single_info = create_torrent_file(single_source, single_torrent_path, tracker.announce_url());
     const auto bundle_info = create_torrent_file(bundle_source, bundle_torrent_path, tracker.announce_url());
     const auto magnet_info = create_torrent_file(magnet_source, magnet_torrent_path, tracker.announce_url());
     const auto private_info = create_torrent_file(
         private_source, private_torrent_path, tracker.announce_url(), true);
     const auto recovery_info = create_torrent_file(recovery_source, recovery_torrent_path, tracker.announce_url());
+    const auto select_info = create_torrent_file(select_source, select_torrent_path, tracker.announce_url());
 
     lt::settings_pack seed_settings;
     seed_settings.set_str(lt::settings_pack::listen_interfaces, "127.0.0.1:0");
@@ -597,10 +602,11 @@ void run_download_integration_test() {
     const auto magnet_seed = add_seed(seeder, magnet_info, seed_root);
     const auto private_seed = add_seed(seeder, private_info, seed_root);
     const auto recovery_seed = add_seed(seeder, recovery_info, seed_root);
+    const auto select_seed = add_seed(seeder, select_info, seed_root);
     expect(single_seed.is_valid() && bundle_seed.is_valid() && magnet_seed.is_valid()
-            && private_seed.is_valid() && recovery_seed.is_valid(),
+            && private_seed.is_valid() && recovery_seed.is_valid() && select_seed.is_valid(),
         "local seeder handle is invalid");
-    wait_for_seeds({single_seed, bundle_seed, magnet_seed, private_seed, recovery_seed});
+    wait_for_seeds({single_seed, bundle_seed, magnet_seed, private_seed, recovery_seed, select_seed});
     bt::Engine engine([](const std::string&, const nlohmann::json&) {});
     engine.dispatch("engine.initialize", {
         {"protocolVersion", "1.0"},
@@ -613,11 +619,13 @@ void run_download_integration_test() {
     const auto magnet_download = temporary.path() / "magnet-download";
     const auto private_download = temporary.path() / "private-download";
     const auto disk_full_download = temporary.path() / "disk-full-download";
+    const auto select_download = temporary.path() / "select-download";
     std::filesystem::create_directories(single_download);
     std::filesystem::create_directories(bundle_download);
     std::filesystem::create_directories(magnet_download);
     std::filesystem::create_directories(private_download);
     std::filesystem::create_directories(disk_full_download);
+    std::filesystem::create_directories(select_download);
 
     const auto single_id = add_torrent_task(engine, single_torrent_path, single_download);
     const auto single_task = wait_for_completion(engine, single_id, tracker, single_seed);
@@ -662,6 +670,33 @@ void run_download_integration_test() {
         "magnet task did not report complete byte counts");
     expect(read_bytes(magnet_source) == read_bytes(magnet_download / "magnet.bin"),
         "magnet payload differs from seed");
+
+    const auto select_result = engine.dispatch("task.add", {
+        {"source", {{"kind", "torrentFile"}, {"path", path_utf8(select_torrent_path)}}},
+        {"savePath", path_utf8(select_download)}, {"start", false}});
+    const auto select_id = select_result.at("task").at("id").get<std::string>();
+    const auto set_priorities = engine.dispatch("task.setFilePriorities",
+        {{"id", select_id}, {"priorities", {{"1", 0}}}});
+    expect(set_priorities.at("priorities") == nlohmann::json::array({4, 0}),
+        "file selection returned the wrong priority vector");
+    engine.dispatch("task.resume", {{"id", select_id}});
+    const auto select_task = wait_for_completion(engine, select_id, tracker, select_seed);
+    expect(std::filesystem::is_regular_file(select_download / "select" / "keep.bin"),
+        "selected file was not downloaded");
+    expect(!std::filesystem::exists(select_download / "select" / "skip.bin"),
+        "skipped file was downloaded despite priority 0");
+    expect(read_bytes(select_source / "keep.bin")
+            == read_bytes(select_download / "select" / "keep.bin"),
+        "selected file payload differs from seed");
+    const auto select_details = engine.dispatch("task.details", {{"id", select_id}});
+    const auto& select_files = select_details.at("files");
+    expect(select_files.size() == 2 && select_files[0].at("priority") == 4
+            && select_files[1].at("priority") == 0,
+        "completed file selection did not expose priorities");
+    const auto completed_set = dispatch_rpc(engine, "task.setFilePriorities",
+        {{"id", bundle_id}, {"priorities", {{"0", 0}}}});
+    expect(completed_set.at("error").at("data").at("code") == "TASK_UNAVAILABLE",
+        "completed task accepted file priority changes");
 
     const auto private_id = add_torrent_task(engine, private_torrent_path, private_download);
     const auto private_task = wait_for_completion(engine, private_id, tracker, private_seed);

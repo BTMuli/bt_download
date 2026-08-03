@@ -59,3 +59,11 @@
 - [x] 协议 `1.0`/catalog schema 1 迁移保持完成即停止；新安装默认值由 BangumiToday `1.1` 客户端显式下发。
 
 专项需求、边界和验收用例见 [tracker-and-seeding.md](tracker-and-seeding.md)。下一阶段还应在侧载、升级安装和 Store 包实机环境下验证进程启动、父进程强制结束监管、Tracker 网络策略与状态恢复。
+
+## 第 6 步：文件选择与优先级（已完成基础实现）
+
+- [x] `task.setFilePriorities` 部分索引更新，优先级 `0`（跳过）/`1`/`4`/`7` 与索引范围校验；
+- [x] 元数据不可用返回 `METADATA_UNAVAILABLE`，已完成/做种任务返回 `TASK_UNAVAILABLE`；
+- [x] `task.details` 文件项返回 `priority`；修改等待磁盘线程异步生效并触发 fast-resume 保存，跨重启恢复；
+- [x] 多文件种子只下载选中文件、跳过文件不落盘，以及完成态拒绝修改的集成测试；
+- [x] BangumiToday 文件标签页按文件勾选“跳过/下载”并即时应用。

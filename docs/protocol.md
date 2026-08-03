@@ -24,6 +24,7 @@
 | `task.list` | - | 返回全量快照与当前事件序号 |
 | `task.get` | `id` | 返回单任务快照 |
 | `task.details` | `id` | 返回任务快照、分片完成状态、文件进度和当前 Peer；文件和 Peer 列表可能截断 |
+| `task.setFilePriorities` | `id`, `priorities` | 更新多文件任务的单个或多个文件优先级 |
 | `task.pause` / `task.resume` | `id` | 持久暂停或继续 |
 | `task.retry` / `task.recheck` | `id` | 重试错误或强制校验 |
 | `task.remove` | `id`, 可选 `deleteData` | 默认只移除任务 |
@@ -56,6 +57,21 @@ Tracker 与做种配置示例：
 - 配置整体验证并原子生效，非法配置返回 `INVALID_CONFIG`；
 - 任务状态新增 `seeding`，快照新增 `uploadedBytes`、`shareRatio`、`seedingSeconds`、`seedRatioLimit`、`seedTimeLimitMinutes` 和 `seedStopReason`；
 - 文件完整性校验完成后，状态直接转为 `seeding`，或在禁用/已满足限制时转为 `completed`；客户端可据此发送文件可用通知，不应等待做种结束。
+
+## 文件选择与优先级
+
+`task.details` 的文件项包含 `priority` 字段。`task.setFilePriorities` 按部分索引更新文件优先级，`priorities` 是文件索引到优先级的对象：
+
+```json
+{"jsonrpc":"2.0","id":"3","method":"task.setFilePriorities","params":{"id":"...","priorities":{"0":4,"2":0}}}
+```
+
+- 优先级取值范围为 `0` 到 `7`：`0` 表示跳过该文件（不下载），`1` 为低优先级，`4` 为默认优先级，`7` 为最高优先级；其余值保留给 libtorrent 的分层优先级；
+- 未出现的文件索引保持原有优先级，引擎合并当前向量后整表下发；响应 `priorities` 返回更新后的完整优先级数组；
+- 索引必须落在 `[0, 文件数)`，优先级必须是整数；`priorities` 必须是非空对象且条目数不超过 2000，否则返回 `INVALID_FILE_PRIORITY`；
+- 元数据不可用时返回 `METADATA_UNAVAILABLE`；已完成或做种中的任务不允许修改（libtorrent 对种子任务不生效），返回 `TASK_UNAVAILABLE`；
+- 修改在磁盘线程异步生效，引擎等待生效后才返回，并随后触发 fast-resume 保存；优先级随 resume 数据跨重启恢复；
+- 被跳过的文件已下载部分不会被删除，也不会从 partfile 移出，UI 应在下载前或暂停时引导用户修改选择。
 
 Tracker 列表源、自动更新时间和最后同步错误由 BangumiToday 管理，不通过本地引擎协议传输。引擎未收到 `seedingEnabled` 时使用安全默认值 `false`；BangumiToday `1.1` 客户端负责在新安装且用户已确认提示后显式传入产品默认值 `true`、`2.0` 和 `60`。
 

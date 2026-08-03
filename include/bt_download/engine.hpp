@@ -40,6 +40,7 @@ private:
     nlohmann::json list_tasks();
     nlohmann::json get_task(const nlohmann::json& params);
     nlohmann::json get_task_details(const nlohmann::json& params);
+    nlohmann::json set_file_priorities(const nlohmann::json& params);
     nlohmann::json pause_task(const nlohmann::json& params);
     nlohmann::json resume_task(const nlohmann::json& params);
     nlohmann::json retry_task(const nlohmann::json& params);
@@ -76,6 +77,7 @@ private:
     std::unique_ptr<libtorrent::session> session_;
     std::unordered_map<std::string, TaskSnapshot> tasks_;
     std::unordered_map<std::string, libtorrent::torrent_handle> handles_;
+    std::unordered_map<std::string, std::vector<libtorrent::download_priority_t>> file_priorities_;
     std::unordered_set<std::string> pending_resume_saves_;
     std::unordered_set<std::string> deferred_resume_saves_;
     std::unordered_set<std::string> pending_task_updates_;
