@@ -122,6 +122,7 @@ if(BT_DOWNLOAD_BUILD_TESTS)
         tests/protocol_test.cpp
         tests/resume_data_test.cpp
         tests/task_test.cpp
+        tests/user_agent_test.cpp
     )
     target_link_libraries(bt_download_tests PRIVATE bt_download_core)
     target_include_directories(bt_download_tests PRIVATE src)

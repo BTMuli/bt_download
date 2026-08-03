@@ -42,6 +42,8 @@ constexpr auto final_resume_timeout = std::chrono::seconds(10);
 constexpr std::uintmax_t max_resume_file_bytes = 64U * 1024U * 1024U;
 constexpr std::size_t max_detail_files = 2000;
 constexpr std::size_t max_detail_peers = 500;
+constexpr std::string_view default_user_agent = "bt_download/" BT_DOWNLOAD_VERSION;
+constexpr std::size_t max_user_agent_bytes = 255;
 
 std::string path_utf8(const std::filesystem::path& path) {
 #if defined(__cpp_lib_char8_t)
@@ -123,7 +125,7 @@ std::pair<int, int> parse_protocol_version(std::string_view version) {
     return {major, minor};
 }
 
-lt::settings_pack make_settings(const EngineConfig& config) {
+lt::settings_pack make_settings(const EngineConfig& config, const std::string& user_agent) {
     lt::settings_pack settings;
     settings.set_int(lt::settings_pack::active_downloads, config.active_downloads);
     settings.set_int(lt::settings_pack::active_limit, -1);
@@ -131,6 +133,7 @@ lt::settings_pack make_settings(const EngineConfig& config) {
     settings.set_int(lt::settings_pack::connections_limit, config.connections_limit);
     settings.set_int(lt::settings_pack::download_rate_limit, static_cast<int>(config.download_rate_limit));
     settings.set_int(lt::settings_pack::upload_rate_limit, static_cast<int>(config.upload_rate_limit));
+    settings.set_str(lt::settings_pack::user_agent, user_agent);
     const auto alert_mask = lt::alert_category::error | lt::alert_category::storage;
     settings.set_int(lt::settings_pack::alert_mask, static_cast<int>(static_cast<std::uint32_t>(alert_mask)));
     settings.set_bool(lt::settings_pack::enable_dht, true);
@@ -192,6 +195,20 @@ bool Engine::shutdown_requested() const noexcept {
 nlohmann::json Engine::initialize(const nlohmann::json& params) {
     std::scoped_lock lock(mutex_);
     if (initialized_) fail(-32000, "ALREADY_INITIALIZED", "engine is already initialized");
+    if (params.contains("userAgent")) {
+        if (!params.at("userAgent").is_string()) {
+            fail(-32602, "INVALID_USER_AGENT", "userAgent must be a string");
+        }
+        const auto user_agent = params.at("userAgent").get<std::string>();
+        if (user_agent.empty() || user_agent.size() > max_user_agent_bytes) {
+            fail(-32602, "INVALID_USER_AGENT",
+                "userAgent must contain between 1 and 255 characters");
+        }
+        user_agent_ = user_agent;
+    }
+    else {
+        user_agent_ = std::string(default_user_agent);
+    }
     const auto protocol = params.value("protocolVersion", std::string{});
     try {
         const auto [client_major, client_minor] = parse_protocol_version(protocol);
@@ -225,7 +242,7 @@ nlohmann::json Engine::initialize(const nlohmann::json& params) {
             fail(-32602, "INVALID_CONFIG", exception.what());
         }
     }
-    session_ = std::make_unique<lt::session>(make_settings(config_));
+    session_ = std::make_unique<lt::session>(make_settings(config_, user_agent_));
     apply_local_rate_limits(*session_, config_);
     initialized_ = true;
     if (load_catalog_locked()) {
@@ -245,7 +262,7 @@ nlohmann::json Engine::initialize(const nlohmann::json& params) {
             initialized_ = false;
             fail(-32602, "INVALID_CONFIG", exception.what());
         }
-        session_->apply_settings(make_settings(config_));
+        session_->apply_settings(make_settings(config_, user_agent_));
         apply_local_rate_limits(*session_, config_);
         apply_additional_trackers_to_all_locked(false);
         persist_catalog_locked();
@@ -286,7 +303,7 @@ nlohmann::json Engine::configure(const nlohmann::json& params) {
     } catch (const std::invalid_argument& exception) {
         fail(-32602, "INVALID_CONFIG", exception.what());
     }
-    session_->apply_settings(make_settings(config_));
+    session_->apply_settings(make_settings(config_, user_agent_));
     apply_local_rate_limits(*session_, config_);
     apply_additional_trackers_to_all_locked(true);
     update_snapshots_locked(true);
@@ -801,7 +818,7 @@ bool Engine::load_catalog_locked() {
                 config_.seed_ratio_limit = 2.0;
                 config_.seed_time_limit_minutes = 60;
             }
-            session_->apply_settings(make_settings(config_));
+            session_->apply_settings(make_settings(config_, user_agent_));
             apply_local_rate_limits(*session_, config_);
         }
         if (!protocol_v1_1_features_

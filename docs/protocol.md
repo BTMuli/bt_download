@@ -8,7 +8,7 @@
 
 1. 客户端启动 `bt_download.exe`。
 2. 引擎发出 `event.ready`，其中包含协议版本、引擎版本和 `features`。
-3. 客户端调用 `engine.initialize`，传入 `protocolVersion`、绝对 `statePath` 和可选 `config`。
+3. 客户端调用 `engine.initialize`，传入 `protocolVersion`、绝对 `statePath`、可选 `userAgent` 和可选 `config`。
 4. 客户端先调用 `task.list` 获取事实快照，再消费增量事件。
 5. 退出时调用 `engine.shutdown`；引擎持久化后回复并退出。
 
@@ -16,7 +16,7 @@
 
 | 方法 | 必需参数 | 说明 |
 | --- | --- | --- |
-| `engine.initialize` | `protocolVersion`, `statePath` | 初始化会话并恢复目录 |
+| `engine.initialize` | `protocolVersion`, `statePath` | 初始化会话并恢复目录（可选 `userAgent` 设置 BT 下载/上传 UA） |
 | `engine.status` | - | 版本、运行时间、统计和配置 |
 | `engine.configure` | 配置字段 | 运行时更新并持久化资源限制、补充 Tracker 和做种策略 |
 | `engine.shutdown` | - | 保存、停止并退出 |
@@ -35,6 +35,11 @@
 {"kind":"torrentFile","path":"C:\\absolute\\a.torrent"}
 {"kind":"magnet","uri":"magnet:?xt=urn:btih:..."}
 ```
+
+客户端在 `engine.initialize` 中可传入 `userAgent`，作为引擎的 BT 下载/上传 UA
+（tracker、web seed 与 Peer 握手共用），格式与 Bangumi 请求 UA 保持一致
+（`BangumiToday/<版本>`）；未传或为空时使用默认值 `bt_download/<引擎版本>`
+（即 `BT_DOWNLOAD_VERSION`）。
 
 配置字段以字节/秒、秒、分钟和计数为单位：`activeDownloads`、`downloadRateLimit`、`uploadRateLimit`、`connectionsLimit`、`connectionsPerTask`、`metadataTimeoutSeconds`、`additionalTrackers`、`seedingEnabled`、`seedRatioLimit`、`seedTimeLimitMinutes`。速率 `0` 表示不限速；Magnet 元数据超时默认 300 秒，取值范围为 1 至 86400 秒。
 

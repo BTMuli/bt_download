@@ -84,6 +84,7 @@ private:
     std::unordered_map<std::string, std::chrono::steady_clock::time_point> metadata_started_;
     std::filesystem::path state_path_;
     EngineConfig config_;
+    std::string user_agent_;
     std::chrono::steady_clock::time_point started_at_;
     std::chrono::steady_clock::time_point next_resume_save_;
     std::uint64_t sequence_{0};
