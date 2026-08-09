@@ -141,23 +141,6 @@ bool replace_file(const std::filesystem::path& temporary, const std::filesystem:
 #endif
 }
 
-std::pair<int, int> parse_protocol_version(std::string_view version) {
-    const auto separator = version.find('.');
-    if (separator == std::string_view::npos || separator == 0 || separator + 1 >= version.size()) {
-        throw std::invalid_argument("protocolVersion must use major.minor format");
-    }
-    int major = 0;
-    int minor = 0;
-    const auto major_result = std::from_chars(version.data(), version.data() + separator, major);
-    const auto minor_result = std::from_chars(version.data() + separator + 1, version.data() + version.size(), minor);
-    if (major_result.ec != std::errc{} || major_result.ptr != version.data() + separator
-        || minor_result.ec != std::errc{} || minor_result.ptr != version.data() + version.size()
-        || major < 0 || minor < 0) {
-        throw std::invalid_argument("protocolVersion must use numeric major.minor format");
-    }
-    return {major, minor};
-}
-
 lt::settings_pack make_settings(const EngineConfig& config, const std::string& user_agent) {
     lt::settings_pack settings;
     settings.set_int(lt::settings_pack::active_downloads, config.active_downloads);
@@ -244,16 +227,8 @@ nlohmann::json Engine::initialize(const nlohmann::json& params) {
     else {
         user_agent_ = std::string(default_user_agent);
     }
-    const auto protocol = params.value("protocolVersion", std::string{});
-    try {
-        const auto [client_major, client_minor] = parse_protocol_version(protocol);
-        const auto [engine_major, engine_minor] = parse_protocol_version(BT_DOWNLOAD_PROTOCOL_VERSION);
-        if (client_major != engine_major || client_minor > engine_minor) {
-            fail(-32000, "PROTOCOL_MISMATCH", "unsupported protocol version");
-        }
-        protocol_v1_1_features_ = client_minor >= 1;
-        protocol_v1_2_features_ = client_minor >= 2;
-    } catch (const std::invalid_argument&) {
+    // 客户端与引擎始终同版本发布，协议版本必须严格一致。
+    if (params.value("protocolVersion", std::string{}) != BT_DOWNLOAD_PROTOCOL_VERSION) {
         fail(-32000, "PROTOCOL_MISMATCH", "unsupported protocol version");
     }
     const auto raw_state_path = params.at("statePath").get<std::string>();
@@ -265,13 +240,6 @@ nlohmann::json Engine::initialize(const nlohmann::json& params) {
 
     const bool has_initial_config = params.contains("config");
     if (has_initial_config) {
-        if (!protocol_v1_1_features_
-            && (params["config"].contains("additionalTrackers")
-                || params["config"].contains("seedingEnabled")
-                || params["config"].contains("seedRatioLimit")
-                || params["config"].contains("seedTimeLimitMinutes"))) {
-            fail(-32000, "PROTOCOL_MISMATCH", "Tracker and seeding settings require protocol 1.1");
-        }
         try {
             config_ = apply_config_patch(config_, params["config"]);
         } catch (const std::invalid_argument& exception) {
@@ -281,13 +249,7 @@ nlohmann::json Engine::initialize(const nlohmann::json& params) {
     session_ = std::make_unique<lt::session>(make_settings(config_, user_agent_));
     apply_local_rate_limits(*session_, config_);
     initialized_ = true;
-    if (load_catalog_locked()) {
-        handles_.clear();
-        tasks_.clear();
-        session_.reset();
-        initialized_ = false;
-        fail(-32000, "PROTOCOL_MISMATCH", "persisted state requires protocol 1.1");
-    }
+    load_catalog_locked();
     if (has_initial_config) {
         try {
             config_ = apply_config_patch(config_, params["config"]);
@@ -329,11 +291,6 @@ nlohmann::json Engine::status() const {
 nlohmann::json Engine::configure(const nlohmann::json& params) {
     std::scoped_lock lock(mutex_);
     require_initialized();
-    if (!protocol_v1_1_features_
-        && (params.contains("additionalTrackers") || params.contains("seedingEnabled")
-            || params.contains("seedRatioLimit") || params.contains("seedTimeLimitMinutes"))) {
-        fail(-32000, "PROTOCOL_MISMATCH", "Tracker and seeding settings require protocol 1.1");
-    }
     try {
         config_ = apply_config_patch(config_, params);
     } catch (const std::invalid_argument& exception) {
@@ -348,7 +305,7 @@ nlohmann::json Engine::configure(const nlohmann::json& params) {
 }
 
 bool Engine::effective_seeding_enabled() const noexcept {
-    return protocol_v1_1_features_ && config_.seeding_enabled;
+    return config_.seeding_enabled;
 }
 
 void Engine::apply_additional_trackers_locked(const lt::torrent_handle& handle, bool reannounce) {
@@ -372,7 +329,7 @@ void Engine::apply_additional_trackers_locked(const lt::torrent_handle& handle, 
         next.push_back(std::move(entry));
     }
 
-    if (protocol_v1_1_features_ && !info->priv()) {
+    if (!info->priv()) {
         const auto supplemental_tier = static_cast<std::uint8_t>(std::min(255, highest_tier + 1));
         for (const auto& url : config_.additional_trackers) {
             if (!urls.insert(url).second) continue;
@@ -628,19 +585,10 @@ nlohmann::json Engine::get_task_details(const nlohmann::json& params) {
     require_initialized();
     const auto id = params.at("id").get<std::string>();
     auto details = task_overview_locked(id);
-    if (protocol_v1_2_features_) {
-        details["files"] = nlohmann::json::array();
-        details["filesTruncated"] = false;
-        details["peers"] = nlohmann::json::array();
-        details["peersTruncated"] = false;
-        return details;
-    }
-    const auto files = task_files_locked(id, 0, max_detail_files);
-    details["files"] = files.at("files");
-    details["filesTruncated"] = files.at("filesTruncated");
-    const auto peers = task_peers_locked(id, 0, max_detail_peers);
-    details["peers"] = peers.at("peers");
-    details["peersTruncated"] = peers.at("peersTruncated");
+    details["files"] = nlohmann::json::array();
+    details["filesTruncated"] = false;
+    details["peers"] = nlohmann::json::array();
+    details["peersTruncated"] = false;
     return details;
 }
 
@@ -936,10 +884,6 @@ bool Engine::load_catalog_locked() {
             }
             session_->apply_settings(make_settings(config_, user_agent_));
             apply_local_rate_limits(*session_, config_);
-        }
-        if (!protocol_v1_1_features_
-            && (config_.seeding_enabled || !config_.additional_trackers.empty())) {
-            return true;
         }
         for (const auto& item : catalog.value("tasks", nlohmann::json::array())) {
             try {

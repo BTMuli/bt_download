@@ -72,6 +72,12 @@
 
 - [x] `task.details` 对 `1.2` 客户端只返回概览（任务、分片状态、`totalFiles`/`totalPeers`），不再携带大列表；
 - [x] 新增 `task.files` / `task.peers`，`offset`/`limit` 窗口、`*Truncated` 与 `nextOffset` 分页语义和 `INVALID_PAGINATION` 校验；
-- [x] `1.0`/`1.1` 客户端继续收到 `task.details` 全量列表，行为不回归；
 - [x] `event.ready`、`engine.initialize` 与 `engine.status` 的 `features` 增加 `tabbedDetails`；
 - [x] 引擎侧覆盖概览拆分、分页窗口、越界与非法分页参数的协议测试。
+
+## 第 8 步：与客户端严格同步（移除旧协议兼容）
+
+- [x] `engine.initialize` 要求 `protocolVersion` 与引擎严格一致（`1.2`），移除 `1.0`/`1.1` 协商与 `protocol_v1_*_features_` 门控；
+- [x] `task.details` 对所有客户端只返回概览，移除旧客户端全量列表分支；
+- [x] Tracker/做种配置不再按客户端版本门控，持久状态加载移除版本检查；
+- [x] 测试与文档统一收敛到协议 `1.2`。

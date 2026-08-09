@@ -91,7 +91,7 @@ void run_resume_data_tests() {
     {
         bt::Engine engine([](const std::string&, const nlohmann::json&) {});
         const auto initialized = engine.dispatch("engine.initialize", {
-            {"protocolVersion", "1.1"}, {"statePath", path_utf8(legacy_state_path)}});
+            {"protocolVersion", "1.2"}, {"statePath", path_utf8(legacy_state_path)}});
         expect(initialized.at("config").at("seedingEnabled") == false,
             "schema 1 migration silently enabled seeding");
         expect(initialized.at("config").at("additionalTrackers").empty(),
@@ -104,11 +104,11 @@ void run_resume_data_tests() {
         expect(migrated.at("schemaVersion") == 2, "schema 1 catalog was not migrated to schema 2");
     }
 
-    const auto protocol_1_1_state_path = temporary.path() / "protocol-1-1-state";
+    const auto seeding_state_path = temporary.path() / "seeding-state";
     {
         bt::Engine engine([](const std::string&, const nlohmann::json&) {});
         engine.dispatch("engine.initialize", {
-            {"protocolVersion", "1.1"}, {"statePath", path_utf8(protocol_1_1_state_path)},
+            {"protocolVersion", "1.2"}, {"statePath", path_utf8(seeding_state_path)},
             {"config", {{"seedingEnabled", true}, {"seedRatioLimit", 2.0},
                 {"seedTimeLimitMinutes", 60}}}});
         engine.dispatch("engine.shutdown", nlohmann::json::object());
@@ -118,12 +118,12 @@ void run_resume_data_tests() {
         bool rejected = false;
         try {
             engine.dispatch("engine.initialize", {
-                {"protocolVersion", "1.0"}, {"statePath", path_utf8(protocol_1_1_state_path)}});
+                {"protocolVersion", "1.1"}, {"statePath", path_utf8(seeding_state_path)}});
         } catch (const std::exception& exception) {
-            rejected = std::string(exception.what()).find("persisted state requires protocol 1.1")
+            rejected = std::string(exception.what()).find("unsupported protocol version")
                 != std::string::npos;
         }
-        expect(rejected, "protocol 1.0 silently accepted persisted protocol 1.1 settings");
+        expect(rejected, "stale protocol 1.1 client was not rejected");
     }
 
     const auto state_path = temporary.path() / "state";
@@ -135,7 +135,7 @@ void run_resume_data_tests() {
     {
         bt::Engine engine([](const std::string&, const nlohmann::json&) {});
         engine.dispatch("engine.initialize", {
-            {"protocolVersion", "1.0"}, {"statePath", path_utf8(state_path)}});
+            {"protocolVersion", "1.2"}, {"statePath", path_utf8(state_path)}});
         const auto added = engine.dispatch("task.add", {
             {"source", {{"kind", "torrentFile"}, {"path", path_utf8(torrent_path)}}},
             {"savePath", path_utf8(save_path)}, {"start", false}});
@@ -143,10 +143,10 @@ void run_resume_data_tests() {
         const auto details = engine.dispatch("task.details", {{"id", task_id}});
         expect(details.at("pieceCount") == 1 && details.at("pieceLength") == 16 * 1024,
             "task details did not expose torrent pieces");
-        expect(details.at("files").size() == 1
-                && details.at("files").front().at("path") == "payload.bin",
-            "task details did not expose torrent files");
-        expect(details.at("peers").is_array() && details.at("completedPieces").is_string(),
+        expect(details.at("totalFiles") == 1 && details.at("files") == nlohmann::json::array(),
+            "task details must not carry the file list");
+        expect(details.at("peers") == nlohmann::json::array()
+                && details.at("completedPieces").is_string(),
             "task details returned invalid dynamic sections");
         const auto resume_path = state_path / "resume" / (task_id + ".fastresume");
         engine.dispatch("task.pause", {{"id", task_id}});
@@ -166,7 +166,7 @@ void run_resume_data_tests() {
     {
         bt::Engine engine([](const std::string&, const nlohmann::json&) {});
         const auto initialized = engine.dispatch("engine.initialize", {
-            {"protocolVersion", "1.0"}, {"statePath", path_utf8(state_path)}});
+            {"protocolVersion", "1.2"}, {"statePath", path_utf8(state_path)}});
         expect(initialized.at("restoredTasks") == 1, "resume task was not restored");
         const auto task = engine.dispatch("task.get", {{"id", task_id}}).at("task");
         expect(task.at("state") == "paused", "restored task did not preserve paused state");
@@ -180,7 +180,7 @@ void run_resume_data_tests() {
     {
         bt::Engine engine([](const std::string&, const nlohmann::json&) {});
         const auto initialized = engine.dispatch("engine.initialize", {
-            {"protocolVersion", "1.0"}, {"statePath", path_utf8(state_path)}});
+            {"protocolVersion", "1.2"}, {"statePath", path_utf8(state_path)}});
         expect(initialized.at("restoredTasks") == 1, "damaged resume data prevented source fallback");
         engine.dispatch("engine.shutdown", nlohmann::json::object());
     }

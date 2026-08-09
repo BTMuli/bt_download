@@ -175,15 +175,4 @@ void run_tabbed_details_tests() {
 
         engine.dispatch("engine.shutdown", nlohmann::json::object());
     }
-
-    {
-        bt::Engine legacy([](const std::string&, const nlohmann::json&) {});
-        legacy.dispatch("engine.initialize", {
-            {"protocolVersion", "1.1"}, {"statePath", path_utf8(state_path)}});
-        const auto details = legacy.dispatch("task.details", {{"id", task_id}});
-        expect(details.at("files").size() == 2 && details.at("peers") == nlohmann::json::array(),
-            "1.1 clients must keep receiving the full task.details payload");
-        expect(details.at("totalFiles") == 2, "legacy task.details did not report totalFiles");
-        legacy.dispatch("engine.shutdown", nlohmann::json::object());
-    }
 }

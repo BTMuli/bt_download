@@ -96,8 +96,6 @@ private:
     std::jthread worker_;
     bool initialized_{false};
     bool shutdown_requested_{false};
-    bool protocol_v1_1_features_{false};
-    bool protocol_v1_2_features_{false};
 };
 
 } // namespace bt

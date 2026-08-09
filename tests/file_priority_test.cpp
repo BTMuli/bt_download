@@ -106,7 +106,7 @@ void run_file_priority_tests() {
     {
         bt::Engine engine([](const std::string&, const nlohmann::json&) {});
         engine.dispatch("engine.initialize", {
-            {"protocolVersion", "1.1"}, {"statePath", path_utf8(state_path)}});
+            {"protocolVersion", "1.2"}, {"statePath", path_utf8(state_path)}});
 
         expect_error(dispatch_rpc(engine, "task.setFilePriorities",
             {{"id", "missing"}, {"priorities", {{"0", 0}}}}), "TASK_NOT_FOUND");
@@ -140,11 +140,11 @@ void run_file_priority_tests() {
         expect(set.at("result").at("priorities") == nlohmann::json::array({4, 0}),
             "file priority update returned the wrong full vector");
 
-        const auto details = dispatch_rpc(engine, "task.details", {{"id", task_id}});
+        const auto details = dispatch_rpc(engine, "task.files", {{"id", task_id}});
         const auto& files = details.at("result").at("files");
         expect(files.size() == 2
                 && files[0].at("priority") == 4 && files[1].at("priority") == 0,
-            "task details did not expose updated file priorities");
+            "task.files did not expose updated file priorities");
 
         engine.dispatch("engine.shutdown", nlohmann::json::object());
     }
@@ -152,8 +152,8 @@ void run_file_priority_tests() {
     {
         bt::Engine engine([](const std::string&, const nlohmann::json&) {});
         engine.dispatch("engine.initialize", {
-            {"protocolVersion", "1.1"}, {"statePath", path_utf8(state_path)}});
-        const auto details = dispatch_rpc(engine, "task.details", {{"id", task_id}});
+            {"protocolVersion", "1.2"}, {"statePath", path_utf8(state_path)}});
+        const auto details = dispatch_rpc(engine, "task.files", {{"id", task_id}});
         const auto& files = details.at("result").at("files");
         expect(files.size() == 2
                 && files[1].at("priority") == 0,
