@@ -13,7 +13,8 @@ int main() {
     protocol = &server;
     server.send_event("event.ready", {
         {"protocolVersion", BT_DOWNLOAD_PROTOCOL_VERSION}, {"engineVersion", BT_DOWNLOAD_VERSION},
-        {"features", nlohmann::json::array({"additionalTrackers", "limitedSeeding", "filePriorities"})}});
+        {"features", nlohmann::json::array({"additionalTrackers", "limitedSeeding", "filePriorities",
+            "taskDetails", "tabbedDetails"})}});
     const int result = server.run();
     if (!engine.shutdown_requested()) engine.dispatch("engine.shutdown", nlohmann::json::object());
     return result;

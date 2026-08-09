@@ -11,10 +11,12 @@
 #include <charconv>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <random>
 #include <sstream>
 #include <system_error>
 #include <thread>
+#include <utility>
 
 #include <libtorrent/add_torrent_params.hpp>
 #include <libtorrent/alert_types.hpp>
@@ -44,6 +46,37 @@ constexpr std::size_t max_detail_files = 2000;
 constexpr std::size_t max_detail_peers = 500;
 constexpr std::string_view default_user_agent = "bt_download/" BT_DOWNLOAD_VERSION;
 constexpr std::size_t max_user_agent_bytes = 255;
+
+std::optional<std::uint64_t> page_value(const nlohmann::json& value) {
+    if (!value.is_number_integer()) return std::nullopt;
+    if (value.is_number_unsigned()) return value.get<std::uint64_t>();
+    const auto signed_value = value.get<std::int64_t>();
+    if (signed_value < 0) return std::nullopt;
+    return static_cast<std::uint64_t>(signed_value);
+}
+
+std::pair<std::size_t, std::size_t> parse_task_page(
+    const nlohmann::json& params, std::size_t max_limit) {
+    std::size_t offset = 0;
+    std::size_t limit = max_limit;
+    if (params.contains("offset")) {
+        const auto value = page_value(params.at("offset"));
+        if (!value
+            || *value > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
+            fail(-32602, "INVALID_PAGINATION", "offset must be a non-negative integer");
+        }
+        offset = static_cast<std::size_t>(*value);
+    }
+    if (params.contains("limit")) {
+        const auto value = page_value(params.at("limit"));
+        if (!value || *value < 1 || *value > max_limit) {
+            fail(-32602, "INVALID_PAGINATION",
+                "limit must be an integer between 1 and " + std::to_string(max_limit));
+        }
+        limit = static_cast<std::size_t>(*value);
+    }
+    return {offset, limit};
+}
 
 std::string path_utf8(const std::filesystem::path& path) {
 #if defined(__cpp_lib_char8_t)
@@ -178,6 +211,8 @@ nlohmann::json Engine::dispatch(const std::string& method, const nlohmann::json&
     if (method == "task.list") return list_tasks();
     if (method == "task.get") return get_task(params);
     if (method == "task.details") return get_task_details(params);
+    if (method == "task.files") return get_task_files(params);
+    if (method == "task.peers") return get_task_peers(params);
     if (method == "task.setFilePriorities") return set_file_priorities(params);
     if (method == "task.pause") return pause_task(params);
     if (method == "task.resume") return resume_task(params);
@@ -217,6 +252,7 @@ nlohmann::json Engine::initialize(const nlohmann::json& params) {
             fail(-32000, "PROTOCOL_MISMATCH", "unsupported protocol version");
         }
         protocol_v1_1_features_ = client_minor >= 1;
+        protocol_v1_2_features_ = client_minor >= 2;
     } catch (const std::invalid_argument&) {
         fail(-32000, "PROTOCOL_MISMATCH", "unsupported protocol version");
     }
@@ -271,7 +307,7 @@ nlohmann::json Engine::initialize(const nlohmann::json& params) {
     worker_ = std::jthread([this](std::stop_token token) { worker_loop(token); });
     return {{"protocolVersion", BT_DOWNLOAD_PROTOCOL_VERSION}, {"engineVersion", BT_DOWNLOAD_VERSION},
             {"libtorrentVersion", LIBTORRENT_VERSION}, {"restoredTasks", tasks_.size()},
-            {"features", nlohmann::json::array({"additionalTrackers", "limitedSeeding", "taskDetails"})},
+            {"features", nlohmann::json::array({"additionalTrackers", "limitedSeeding", "taskDetails", "tabbedDetails"})},
             {"config", config_json(config_)}};
 }
 
@@ -286,7 +322,7 @@ nlohmann::json Engine::status() const {
     return {{"initialized", initialized_}, {"protocolVersion", BT_DOWNLOAD_PROTOCOL_VERSION},
             {"engineVersion", BT_DOWNLOAD_VERSION}, {"libtorrentVersion", LIBTORRENT_VERSION},
             {"uptimeSeconds", uptime}, {"taskCount", tasks_.size()}, {"activeTasks", active},
-            {"features", nlohmann::json::array({"additionalTrackers", "limitedSeeding", "taskDetails"})},
+            {"features", nlohmann::json::array({"additionalTrackers", "limitedSeeding", "taskDetails", "tabbedDetails"})},
             {"config", config_json(config_)}};
 }
 
@@ -462,10 +498,7 @@ nlohmann::json Engine::get_task(const nlohmann::json& params) {
     return {{"task", require_task_locked(params.at("id").get<std::string>())}, {"sequence", sequence_}};
 }
 
-nlohmann::json Engine::get_task_details(const nlohmann::json& params) {
-    std::scoped_lock lock(mutex_);
-    require_initialized();
-    const auto id = params.at("id").get<std::string>();
+nlohmann::json Engine::task_overview_locked(const std::string& id) {
     const auto& task = require_task_locked(id);
     const auto found = handles_.find(id);
     if (found == handles_.end() || !found->second.is_valid()) {
@@ -474,27 +507,52 @@ nlohmann::json Engine::get_task_details(const nlohmann::json& params) {
 
     const auto& handle = found->second;
     const auto info = handle.torrent_file();
-    nlohmann::json details = {
+    nlohmann::json overview = {
         {"task", task},
         {"pieceLength", 0},
         {"pieceCount", 0},
         {"completedPieces", ""},
-        {"files", nlohmann::json::array()},
-        {"filesTruncated", false},
-        {"peers", nlohmann::json::array()},
-        {"peersTruncated", false},
+        {"totalFiles", 0},
+        {"totalPeers", 0},
     };
-    if (!info) return details;
+    if (!info) return overview;
 
     const auto status = handle.status(lt::torrent_handle::query_name | lt::torrent_handle::query_pieces);
-    details["pieceLength"] = info->piece_length();
-    details["pieceCount"] = info->num_pieces();
+    overview["pieceLength"] = info->piece_length();
+    overview["pieceCount"] = info->num_pieces();
     std::string completed_pieces;
     completed_pieces.reserve(status.pieces.size());
     for (const auto index : status.pieces.range()) {
         completed_pieces.push_back(status.pieces[index] ? '1' : '0');
     }
-    details["completedPieces"] = std::move(completed_pieces);
+    overview["completedPieces"] = std::move(completed_pieces);
+    overview["totalFiles"] = static_cast<std::uint64_t>(info->num_files());
+    std::vector<lt::peer_info> peers;
+    handle.get_peer_info(peers);
+    overview["totalPeers"] = peers.size();
+    return overview;
+}
+
+nlohmann::json Engine::task_files_locked(const std::string& id, std::size_t offset, std::size_t limit) {
+    (void)require_task_locked(id);
+    const auto found = handles_.find(id);
+    if (found == handles_.end() || !found->second.is_valid()) {
+        fail(-32005, "TASK_UNAVAILABLE", "task has no active torrent handle", true);
+    }
+    const auto& handle = found->second;
+    const auto info = handle.torrent_file();
+    nlohmann::json result = {
+        {"files", nlohmann::json::array()},
+        {"filesTruncated", false},
+        {"totalFiles", 0},
+        {"offset", offset},
+        {"nextOffset", nlohmann::json()},
+    };
+    if (!info) return result;
+
+    const auto total_files = static_cast<std::size_t>(info->num_files());
+    result["totalFiles"] = total_files;
+    if (offset >= total_files || limit == 0) return result;
 
     const auto file_progress = handle.file_progress(lt::torrent_handle::piece_granularity);
     std::vector<lt::download_priority_t> priorities;
@@ -504,35 +562,55 @@ nlohmann::json Engine::get_task_details(const nlohmann::json& params) {
     } else {
         priorities = handle.get_file_priorities();
     }
-    std::size_t file_count = 0;
-    for (const auto index : info->files().file_range()) {
-        if (file_count >= max_detail_files) {
-            details["filesTruncated"] = true;
-            break;
-        }
-        const auto size = std::max<std::int64_t>(0, info->files().file_size(index));
-        const auto progress_index = static_cast<std::size_t>(static_cast<int>(index));
-        const auto completed = progress_index < file_progress.size()
-            ? std::clamp<std::int64_t>(file_progress[progress_index], 0, size)
+    const auto end = std::min(total_files, offset + limit);
+    for (std::size_t index = offset; index < end; ++index) {
+        const auto file_index = lt::file_index_t{static_cast<int>(index)};
+        const auto size = std::max<std::int64_t>(0, info->files().file_size(file_index));
+        const auto completed = index < file_progress.size()
+            ? std::clamp<std::int64_t>(file_progress[index], 0, size)
             : 0;
-        const auto priority = progress_index < priorities.size()
-            ? priority_value(priorities[progress_index])
+        const auto priority = index < priorities.size()
+            ? priority_value(priorities[index])
             : priority_value(lt::default_priority);
-        details["files"].push_back({
-            {"path", info->files().file_path(index)},
+        result["files"].push_back({
+            {"path", info->files().file_path(file_index)},
             {"size", size},
             {"completedBytes", completed},
             {"priority", priority},
         });
-        ++file_count;
     }
+    result["filesTruncated"] = end < total_files;
+    if (end < total_files) result["nextOffset"] = end;
+    return result;
+}
+
+nlohmann::json Engine::task_peers_locked(const std::string& id, std::size_t offset, std::size_t limit) {
+    (void)require_task_locked(id);
+    const auto found = handles_.find(id);
+    if (found == handles_.end() || !found->second.is_valid()) {
+        fail(-32005, "TASK_UNAVAILABLE", "task has no active torrent handle", true);
+    }
+    const auto& handle = found->second;
+    const auto info = handle.torrent_file();
+    nlohmann::json result = {
+        {"peers", nlohmann::json::array()},
+        {"peersTruncated", false},
+        {"totalPeers", 0},
+        {"offset", offset},
+        {"nextOffset", nlohmann::json()},
+    };
+    if (!info) return result;
 
     std::vector<lt::peer_info> peers;
     handle.get_peer_info(peers);
-    const auto peer_count = std::min(peers.size(), max_detail_peers);
-    for (std::size_t index = 0; index < peer_count; ++index) {
+    const auto total_peers = peers.size();
+    result["totalPeers"] = total_peers;
+    if (offset >= total_peers || limit == 0) return result;
+
+    const auto end = std::min(total_peers, offset + limit);
+    for (std::size_t index = offset; index < end; ++index) {
         const auto& peer = peers[index];
-        details["peers"].push_back({
+        result["peers"].push_back({
             {"endpoint", endpoint_string(peer.ip)},
             {"client", peer.client.empty() ? "unknown" : peer.client},
             {"progress", std::clamp(peer.progress, 0.0F, 1.0F)},
@@ -540,8 +618,46 @@ nlohmann::json Engine::get_task_details(const nlohmann::json& params) {
             {"uploadRate", std::max(0, peer.payload_up_speed)},
         });
     }
-    details["peersTruncated"] = peers.size() > max_detail_peers;
+    result["peersTruncated"] = end < total_peers;
+    if (end < total_peers) result["nextOffset"] = end;
+    return result;
+}
+
+nlohmann::json Engine::get_task_details(const nlohmann::json& params) {
+    std::scoped_lock lock(mutex_);
+    require_initialized();
+    const auto id = params.at("id").get<std::string>();
+    auto details = task_overview_locked(id);
+    if (protocol_v1_2_features_) {
+        details["files"] = nlohmann::json::array();
+        details["filesTruncated"] = false;
+        details["peers"] = nlohmann::json::array();
+        details["peersTruncated"] = false;
+        return details;
+    }
+    const auto files = task_files_locked(id, 0, max_detail_files);
+    details["files"] = files.at("files");
+    details["filesTruncated"] = files.at("filesTruncated");
+    const auto peers = task_peers_locked(id, 0, max_detail_peers);
+    details["peers"] = peers.at("peers");
+    details["peersTruncated"] = peers.at("peersTruncated");
     return details;
+}
+
+nlohmann::json Engine::get_task_files(const nlohmann::json& params) {
+    std::scoped_lock lock(mutex_);
+    require_initialized();
+    const auto id = params.at("id").get<std::string>();
+    const auto [offset, limit] = parse_task_page(params, max_detail_files);
+    return task_files_locked(id, offset, limit);
+}
+
+nlohmann::json Engine::get_task_peers(const nlohmann::json& params) {
+    std::scoped_lock lock(mutex_);
+    require_initialized();
+    const auto id = params.at("id").get<std::string>();
+    const auto [offset, limit] = parse_task_page(params, max_detail_peers);
+    return task_peers_locked(id, offset, limit);
 }
 
 nlohmann::json Engine::set_file_priorities(const nlohmann::json& params) {

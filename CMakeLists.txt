@@ -44,7 +44,7 @@ target_link_libraries(bt_download_core
 )
 target_compile_definitions(bt_download_core PUBLIC
     BT_DOWNLOAD_VERSION="${PROJECT_VERSION}"
-    BT_DOWNLOAD_PROTOCOL_VERSION="1.1"
+    BT_DOWNLOAD_PROTOCOL_VERSION="1.2"
     _WIN32_WINNT=0x0A00
 )
 if(MSVC)
@@ -121,6 +121,7 @@ if(BT_DOWNLOAD_BUILD_TESTS)
         tests/path_safety_test.cpp
         tests/protocol_test.cpp
         tests/resume_data_test.cpp
+        tests/tabbed_details_test.cpp
         tests/task_test.cpp
         tests/user_agent_test.cpp
     )

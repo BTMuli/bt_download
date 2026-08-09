@@ -9,6 +9,7 @@ void run_protocol_tests();
 void run_resume_data_tests();
 void run_task_tests();
 void run_file_priority_tests();
+void run_tabbed_details_tests();
 void run_user_agent_tests();
 
 int main() {
@@ -21,6 +22,7 @@ int main() {
         run_resume_data_tests();
         run_task_tests();
         run_file_priority_tests();
+        run_tabbed_details_tests();
         run_user_agent_tests();
         std::cout << "All tests passed\n";
         return 0;

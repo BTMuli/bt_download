@@ -43,7 +43,7 @@ Windows Release 发布前应运行独立进程资源基准，采集空闲 CPU/�
 进程启动后先输出 `event.ready`。客户端随后初始化：
 
 ```json
-{"jsonrpc":"2.0","id":"1","method":"engine.initialize","params":{"protocolVersion":"1.1","statePath":"C:\\Users\\me\\AppData\\Local\\BangumiToday\\bt_download"}}
+{"jsonrpc":"2.0","id":"1","method":"engine.initialize","params":{"protocolVersion":"1.2","statePath":"C:\\Users\\me\\AppData\\Local\\BangumiToday\\bt_download"}}
 ```
 
 添加任务：

@@ -1,8 +1,10 @@
 # bt_download 本地调用契约
 
-协议版本：`1.1`。传输为继承的 stdin/stdout 管道，编码为 UTF-8，每个 JSON-RPC 2.0 对象独占一行。单帧最大 1 MiB。客户端必须同时持续读取 stdout 和 stderr；stdout 不包含日志。
+协议版本：`1.2`。传输为继承的 stdin/stdout 管道，编码为 UTF-8，每个 JSON-RPC 2.0 对象独占一行。单帧最大 1 MiB。客户端必须同时持续读取 stdout 和 stderr；stdout 不包含日志。
 
-引擎接受 `1.0` 客户端，但该会话不能配置补充 Tracker 和限量做种，因而不会向旧客户端发送 `seeding` 状态。如果持久状态已经启用 `1.1` 能力，旧客户端初始化将返回 `PROTOCOL_MISMATCH`，避免静默终止正在做种的任务。高于引擎次版本或主版本不同的客户端同样返回该错误。
+引擎接受 `1.0` 和 `1.1` 客户端，但该会话不能配置补充 Tracker 和限量做种，因而不会向旧客户端发送 `seeding` 状态。如果持久状态已经启用 `1.1` 能力，旧客户端初始化将返回 `PROTOCOL_MISMATCH`，避免静默终止正在做种的任务。高于引擎次版本或主版本不同的客户端同样返回该错误。
+
+`1.2` 客户端按 Tab 拆分下载详情：`task.details` 只返回概览（任务、分片状态和文件/Peer 总数），Peer 与文件列表通过 `task.files` / `task.peers` 按需分页拉取。`1.0`/`1.1` 客户端继续在 `task.details` 中收到全量列表，行为与旧协议完全一致。
 
 ## 生命周期
 
@@ -23,7 +25,9 @@
 | `task.add` | `source`, `savePath` | 添加 torrentFile 或 magnet |
 | `task.list` | - | 返回全量快照与当前事件序号 |
 | `task.get` | `id` | 返回单任务快照 |
-| `task.details` | `id` | 返回任务快照、分片完成状态、文件进度和当前 Peer；文件和 Peer 列表可能截断 |
+| `task.details` | `id` | 返回任务快照、分片完成状态和文件/Peer 总数；`1.0`/`1.1` 客户端额外收到截断后的全量文件和 Peer 列表 |
+| `task.files` | `id`, 可选 `offset`/`limit` | 按窗口返回文件进度与优先级，含总数和截断语义 |
+| `task.peers` | `id`, 可选 `offset`/`limit` | 按窗口返回当前 Peer，含总数和截断语义 |
 | `task.setFilePriorities` | `id`, `priorities` | 更新多文件任务的单个或多个文件优先级 |
 | `task.pause` / `task.resume` | `id` | 持久暂停或继续 |
 | `task.retry` / `task.recheck` | `id` | 重试错误或强制校验 |
@@ -65,7 +69,7 @@ Tracker 与做种配置示例：
 
 ## 文件选择与优先级
 
-`task.details` 的文件项包含 `priority` 字段。`task.setFilePriorities` 按部分索引更新文件优先级，`priorities` 是文件索引到优先级的对象：
+文件项（由 `task.details` 或 `task.files` 返回）包含 `priority` 字段。`task.setFilePriorities` 按部分索引更新文件优先级，`priorities` 是文件索引到优先级的对象：
 
 ```json
 {"jsonrpc":"2.0","id":"3","method":"task.setFilePriorities","params":{"id":"...","priorities":{"0":4,"2":0}}}
@@ -78,6 +82,34 @@ Tracker 与做种配置示例：
 - 修改在磁盘线程异步生效，引擎等待生效后才返回，并随后触发 fast-resume 保存；优先级随 resume 数据跨重启恢复；
 - 被跳过的文件已下载部分不会被删除，也不会从 partfile 移出，UI 应在下载前或暂停时引导用户修改选择。
 
+## 下载详情按 Tab 拆分
+
+`1.2` 协议将 Peer/文件列表从 `task.details` 中拆出。概览响应不再携带大列表，文件与 Peer 数量以 `totalFiles` / `totalPeers` 提供，客户端可直接渲染 Tab 计数：
+
+```json
+{"jsonrpc":"2.0","id":"2","method":"task.details","params":{"id":"..."}}
+```
+
+```json
+{"id":"2","jsonrpc":"2.0","result":{"task":{...},"pieceLength":16384,"pieceCount":1024,"completedPieces":"0101...","totalFiles":42,"totalPeers":37,"files":[],"filesTruncated":false,"peers":[],"peersTruncated":false}}
+```
+
+`task.files` / `task.peers` 使用相同的窗口语义：`offset` 默认 `0`，`limit` 默认分别是 `2000` 与 `500`（也是单次窗口上限）。`filesTruncated` / `peersTruncated` 表示当前窗口之后仍有数据；此时 `nextOffset` 为下一页起点，否则为 `null`：
+
+```json
+{"jsonrpc":"2.0","id":"3","method":"task.files","params":{"id":"...","offset":0,"limit":500}}
+```
+
+```json
+{"id":"3","jsonrpc":"2.0","result":{"files":[{"path":"...","size":1048576,"completedBytes":524288,"priority":4}],"filesTruncated":true,"totalFiles":1200,"offset":0,"nextOffset":500}}
+```
+
+- `offset` 必须是非负整数，`limit` 必须是 `1` 到窗口上限的整数，否则返回 `INVALID_PAGINATION`；
+- 窗口起点等于或超过总数时返回空列表且 `*Truncated=false`、`nextOffset=null`；
+- 元数据不可用时文件与 Peer 列表为空、总数与窗口为 `0`（与旧 `task.details` 行为一致）；
+- 两个列表均为当前时刻的快照，Peer 列表分页在连接变化时可能移动窗口，客户端应仅用于展示；
+- 旧引擎（`1.1` 及以下）不实现这两个方法：客户端检测到引擎协议低于 `1.2` 时回退到 `task.details` 全量返回，从概览中提取列表，行为不回归。
+
 Tracker 列表源、自动更新时间和最后同步错误由 BangumiToday 管理，不通过本地引擎协议传输。引擎未收到 `seedingEnabled` 时使用安全默认值 `false`；BangumiToday `1.1` 客户端负责在新安装且用户已确认提示后显式传入产品默认值 `true`、`2.0` 和 `60`。
 
 ## 错误
@@ -88,7 +120,7 @@ JSON-RPC `error.data` 至少包含稳定的业务 `code` 与 `retryable`。调�
 {"jsonrpc":"2.0","id":"2","error":{"code":-32011,"message":"the torrent already exists at this save path","data":{"code":"DUPLICATE_TASK","retryable":false,"taskId":"..."}}}
 ```
 
-常用业务码包括 `NOT_INITIALIZED`、`PROTOCOL_MISMATCH`、`INVALID_CONFIG`、`SOURCE_INVALID`、`SOURCE_UNSUPPORTED`、`UNSAFE_TORRENT_PATH`、`METADATA_TIMEOUT`、`SAVE_PATH_INVALID`、`SAVE_PATH_UNAVAILABLE`、`SAVE_PATH_NOT_WRITABLE`、`DISK_FULL`、`STORAGE_ERROR`、`DATA_VERIFICATION_FAILED`、`NETWORK_UNAVAILABLE`、`DUPLICATE_TASK`、`TASK_NOT_FOUND`、`TASK_UNAVAILABLE`、`PERSISTENCE_ERROR`、`TORRENT_ERROR` 和 `INTERNAL_ERROR`。任务快照的 `lastError` 使用同一组业务码和 `retryable` 语义。
+常用业务码包括 `NOT_INITIALIZED`、`PROTOCOL_MISMATCH`、`INVALID_CONFIG`、`INVALID_PAGINATION`、`SOURCE_INVALID`、`SOURCE_UNSUPPORTED`、`UNSAFE_TORRENT_PATH`、`METADATA_TIMEOUT`、`SAVE_PATH_INVALID`、`SAVE_PATH_UNAVAILABLE`、`SAVE_PATH_NOT_WRITABLE`、`DISK_FULL`、`STORAGE_ERROR`、`DATA_VERIFICATION_FAILED`、`NETWORK_UNAVAILABLE`、`DUPLICATE_TASK`、`TASK_NOT_FOUND`、`TASK_UNAVAILABLE`、`PERSISTENCE_ERROR`、`TORRENT_ERROR` 和 `INTERNAL_ERROR`。任务快照的 `lastError` 使用同一组业务码和 `retryable` 语义。
 
 ## 事件
 

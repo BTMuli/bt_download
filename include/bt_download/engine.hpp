@@ -40,6 +40,8 @@ private:
     nlohmann::json list_tasks();
     nlohmann::json get_task(const nlohmann::json& params);
     nlohmann::json get_task_details(const nlohmann::json& params);
+    nlohmann::json get_task_files(const nlohmann::json& params);
+    nlohmann::json get_task_peers(const nlohmann::json& params);
     nlohmann::json set_file_priorities(const nlohmann::json& params);
     nlohmann::json pause_task(const nlohmann::json& params);
     nlohmann::json resume_task(const nlohmann::json& params);
@@ -49,6 +51,9 @@ private:
     nlohmann::json shutdown();
 
     void require_initialized() const;
+    nlohmann::json task_overview_locked(const std::string& id);
+    nlohmann::json task_files_locked(const std::string& id, std::size_t offset, std::size_t limit);
+    nlohmann::json task_peers_locked(const std::string& id, std::size_t offset, std::size_t limit);
     void finalize_locked();
     void persist_catalog_locked();
     bool load_catalog_locked();
@@ -92,6 +97,7 @@ private:
     bool initialized_{false};
     bool shutdown_requested_{false};
     bool protocol_v1_1_features_{false};
+    bool protocol_v1_2_features_{false};
 };
 
 } // namespace bt

@@ -67,3 +67,11 @@
 - [x] `task.details` 文件项返回 `priority`；修改等待磁盘线程异步生效并触发 fast-resume 保存，跨重启恢复；
 - [x] 多文件种子只下载选中文件、跳过文件不落盘，以及完成态拒绝修改的集成测试；
 - [x] BangumiToday 文件标签页按文件勾选“跳过/下载”并即时应用。
+
+## 第 7 步：下载详情按 Tab 拆分（协议 1.2）
+
+- [x] `task.details` 对 `1.2` 客户端只返回概览（任务、分片状态、`totalFiles`/`totalPeers`），不再携带大列表；
+- [x] 新增 `task.files` / `task.peers`，`offset`/`limit` 窗口、`*Truncated` 与 `nextOffset` 分页语义和 `INVALID_PAGINATION` 校验；
+- [x] `1.0`/`1.1` 客户端继续收到 `task.details` 全量列表，行为不回归；
+- [x] `event.ready`、`engine.initialize` 与 `engine.status` 的 `features` 增加 `tabbedDetails`；
+- [x] 引擎侧覆盖概览拆分、分页窗口、越界与非法分页参数的协议测试。
