@@ -2,12 +2,14 @@
 
 本文把需求分析中的 P0/M0/M1 拆成可独立验证的阶段。勾选项表示本仓库当前已有实现和对应的基础验证，不代表尚未执行的 MSIX、公开网络或 BangumiToday 主仓库验收已经通过。
 
+当前协议版本固定为 `1.2`，与 BangumiToday 随包严格同步；旧版本协商、回退与按客户端版本门控的行为已移除（见第 8 步）。历史步骤中出现的 `1.0`/`1.1` 描述为该阶段交付时的状态。
+
 ## 第 1 步：工程与协议闭环（已完成）
 
 - [x] C++20、CMake Preset、vcpkg 固定依赖和 Windows x64 构建；
 - [x] libtorrent 2.0.11 封装在 `Engine` 内，上层不暴露 libtorrent 类型；
 - [x] stdin/stdout NDJSON + JSON-RPC 2.0，stdout 与 stderr 分离；
-- [x] `event.ready`、协议协商、1 MiB 帧上限和稳定错误结构；
+- [x] `event.ready`、协议版本严格校验、1 MiB 帧上限和稳定错误结构；
 - [x] `engine.initialize/status/configure/shutdown`；
 - [x] `task.add/list/get/pause/resume/retry/recheck/remove`。
 
@@ -17,7 +19,7 @@
 - [x] UUID 任务 ID、同一 info-hash 会话级去重（避免 libtorrent 将不同保存路径静默别名到同一 handle）；
 - [x] metadata/checking/queued/downloading/seeding/paused/completed/error 状态；
 - [x] 500 ms 聚合进度事件（普通进度最多 2 次/秒）和单调序号；
-- [x] 协议 `1.0` 或未显式启用做种时完成后立即暂停；协议 `1.1` 可执行限量做种；
+- [x] 未显式启用做种时完成后立即暂停；限量做种由配置控制；
 - [x] 删除任务默认保留数据，删除数据必须显式传入 `deleteData`；
 - [x] 保存目录绝对路径/存在性/可写性检查；
 - [x] 种子内部绝对路径、盘符和 `..` 穿越拦截；
@@ -49,14 +51,14 @@
 
 ## 第 5 步：Tracker 与限量做种（已完成）
 
-- [x] 协议升级到 `1.1`，配置支持 `additionalTrackers`、`seedingEnabled`、`seedRatioLimit` 和 `seedTimeLimitMinutes`；
+- [x] 配置支持 `additionalTrackers`、`seedingEnabled`、`seedRatioLimit` 和 `seedTimeLimitMinutes`；
 - [x] Tracker URL 二次校验、去重、来源标记和运行时动态应用；
 - [x] 公共 `.torrent`/Magnet 补充 Tracker，私有种子与属性未知 Magnet 的防泄露测试；
 - [x] `seeding` 状态、累计上传/做种时间、停止条件与停止原因；
 - [x] 做种计数的 fast-resume 持久化以及暂停、崩溃、重启恢复测试；
 - [x] 文件可用与做种结束状态分离，做种任务不占活动下载槽；
 - [x] BangumiToday 完成列表源同步、最后成功快照、自动更新和设置页接入；
-- [x] 协议 `1.0`/catalog schema 1 迁移保持完成即停止；新安装默认值由 BangumiToday `1.1` 客户端显式下发。
+- [x] catalog schema 1 迁移保持完成即停止；新安装默认值由 BangumiToday 客户端显式下发。
 
 专项需求、边界和验收用例见 [tracker-and-seeding.md](tracker-and-seeding.md)。下一阶段还应在侧载、升级安装和 Store 包实机环境下验证进程启动、父进程强制结束监管、Tracker 网络策略与状态恢复。
 
@@ -70,7 +72,7 @@
 
 ## 第 7 步：下载详情按 Tab 拆分（协议 1.2）
 
-- [x] `task.details` 对 `1.2` 客户端只返回概览（任务、分片状态、`totalFiles`/`totalPeers`），不再携带大列表；
+- [x] `task.details` 对所有客户端只返回概览（任务、分片状态、`totalFiles`/`totalPeers`），不再携带大列表；
 - [x] 新增 `task.files` / `task.peers`，`offset`/`limit` 窗口、`*Truncated` 与 `nextOffset` 分页语义和 `INVALID_PAGINATION` 校验；
 - [x] `event.ready`、`engine.initialize` 与 `engine.status` 的 `features` 增加 `tabbedDetails`；
 - [x] 引擎侧覆盖概览拆分、分页窗口、越界与非法分页参数的协议测试。
