@@ -33,6 +33,22 @@
 | `task.retry` / `task.recheck` | `id` | 重试错误或强制校验 |
 | `task.remove` | `id`, 可选 `deleteData` | 默认只移除任务 |
 
+### 强制重校验语义
+
+`task.recheck` 是显式的本地文件完整性校验，不等同于 `task.retry`：
+
+- 调用后任务立即进入 `checking`，并通过 `event.taskUpdated` 通知；引擎重新读取
+  磁盘文件，按种子 piece hash 更新已下载和已验证字节；
+- `seeding` 或 `completed` 任务也会被唤醒执行校验。若发现文件或数据块缺失，旧的
+  做种停止原因不会阻止任务进入 `downloading`，任务会重新发现 Peer 并下载缺失数据；
+- 校验完成且任务需要继续联网时，会主动重新公告 Tracker，以便尽快获得可用 Peer；
+- 若数据仍然完整，不会重复下载，任务按当前做种策略回到 `seeding` 或 `completed`。
+
+引擎还会在任务处于 `seeding` 时后台检查 payload 文件的存在和大小（目标间隔约 1 秒）。
+若用户或其他程序删除/截断文件，引擎会自动进入 `checking` 并重新下载缺失数据；用户主动
+暂停的任务以及已因做种策略进入 `completed` 的任务不会因此自动唤醒，后者可调用
+`task.recheck` 恢复。
+
 `source` 有两种形态：
 
 ```json

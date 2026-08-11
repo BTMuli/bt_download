@@ -859,8 +859,16 @@ void run_tracker_and_seeding_integration_test() {
         std::filesystem::create_directories(leecher_download);
         std::string id;
         std::uint16_t first_engine_peer_port = 0;
+        std::atomic_bool automatic_recheck_saw_checking{false};
         {
-            bt::Engine engine([](const std::string&, const nlohmann::json&) {});
+            bt::Engine engine([&automatic_recheck_saw_checking](const std::string& event,
+                const nlohmann::json& params) {
+                if (event == "event.taskUpdated" && params.contains("task")) {
+                    if (params.at("task").at("state") == "checking") {
+                        automatic_recheck_saw_checking.store(true);
+                    }
+                }
+            });
             engine.dispatch("engine.initialize", {
                 {"protocolVersion", "1.2"}, {"statePath", path_utf8(seeding_state_path)},
                 {"config", {{"seedingEnabled", true}, {"seedRatioLimit", 0.1},
@@ -872,12 +880,47 @@ void run_tracker_and_seeding_integration_test() {
             first_engine_peer_port = origin_tracker.last_observed_peer_port();
             expect(first_engine_peer_port != 0 && first_engine_peer_port != seeder.listen_port(),
                 "Tracker did not observe the engine peer port");
+
+            const auto seeding_payload = download / "limited-seeding.bin";
+            std::error_code remove_error;
+            expect(std::filesystem::remove(seeding_payload, remove_error) && !remove_error,
+                "could not remove the active seeding payload for automatic recovery");
+            origin_tracker.set_peer_port(seeder.listen_port());
+            automatic_recheck_saw_checking.store(false);
+            const auto repair_deadline = std::chrono::steady_clock::now() + 30s;
+            nlohmann::json repaired;
+            while (std::chrono::steady_clock::now() < repair_deadline) {
+                repaired = engine.dispatch("task.get", {{"id", id}}).at("task");
+                std::error_code payload_error;
+                const auto payload_size = std::filesystem::is_regular_file(seeding_payload)
+                    ? std::filesystem::file_size(seeding_payload, payload_error)
+                    : 0;
+                if (automatic_recheck_saw_checking.load() && repaired.at("state") == "seeding"
+                    && !payload_error && payload_size == std::filesystem::file_size(seeding_source)) {
+                    break;
+                }
+                std::this_thread::sleep_for(100ms);
+            }
+            expect(automatic_recheck_saw_checking.load(),
+                "deleting an active seeding payload did not trigger automatic checking");
+            expect(repaired.at("state") == "seeding",
+                "automatically repaired seeding task did not return to seeding");
+            expect(std::filesystem::is_regular_file(seeding_payload),
+                "automatic seeding recovery did not redownload the payload");
+            expect(read_bytes(seeding_payload) == read_bytes(seeding_source),
+                "automatically rechecked payload differs from the original seed");
+
             const auto paused = engine.dispatch("task.pause", {{"id", id}}).at("task");
             expect(paused.at("state") == "paused", "seeding task did not pause");
             engine.dispatch("engine.shutdown", nlohmann::json::object());
         }
 
-        bt::Engine restored([](const std::string&, const nlohmann::json&) {});
+        std::vector<std::string> recheck_states;
+        bt::Engine restored([&recheck_states](const std::string& event, const nlohmann::json& params) {
+            if (event == "event.taskUpdated" && params.contains("task")) {
+                recheck_states.push_back(params.at("task").at("state").get<std::string>());
+            }
+        });
         const auto initialized = restored.dispatch("engine.initialize", {
             {"protocolVersion", "1.2"}, {"statePath", path_utf8(seeding_state_path)}});
         expect(initialized.at("restoredTasks") == 1, "paused seeding task was not restored");
@@ -912,6 +955,26 @@ void run_tracker_and_seeding_integration_test() {
         expect(completed.at("shareRatio").get<double>() >= 0.1,
             "reported share ratio did not reach the configured limit");
         const auto uploaded_before_restart = completed.at("uploadedBytes").get<std::uint64_t>();
+
+        const auto seeding_payload = download / "limited-seeding.bin";
+        std::error_code remove_error;
+        expect(std::filesystem::remove(seeding_payload, remove_error) && !remove_error,
+            "could not remove the completed seeding payload for recheck");
+        origin_tracker.set_peer_port(seeder.listen_port());
+        recheck_states.clear();
+        restored.dispatch("task.recheck", {{"id", id}});
+        const auto rechecked = wait_for_state(restored, id, "completed");
+        expect(std::filesystem::is_regular_file(seeding_payload),
+            "rechecking a missing completed payload did not redownload it");
+        expect(read_bytes(seeding_payload) == read_bytes(seeding_source),
+            "rechecked payload differs from the original seed");
+        bool saw_checking = false;
+        for (const auto& state : recheck_states) {
+            saw_checking = saw_checking || state == "checking";
+        }
+        expect(saw_checking, "rechecking a missing completed payload did not enter checking state");
+        expect(rechecked.at("downloadedBytes") == rechecked.at("totalBytes"),
+            "rechecked task did not report complete byte counts");
         restored.dispatch("engine.shutdown", nlohmann::json::object());
 
         bt::Engine verified([](const std::string&, const nlohmann::json&) {});

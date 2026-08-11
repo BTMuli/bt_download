@@ -70,6 +70,7 @@ private:
     void fail_task_locked(const std::string& id, std::string code, std::string message, bool retryable);
     bool load_resume_data_locked(const TaskSnapshot& task, libtorrent::add_torrent_params& add);
     void write_resume_data_locked(const std::string& id, const libtorrent::add_torrent_params& add);
+    void start_recheck_locked(TaskSnapshot& task, libtorrent::torrent_handle& handle);
     std::optional<std::string> task_id_for_handle_locked(const libtorrent::torrent_handle& handle) const;
     TaskSnapshot& require_task_locked(const std::string& id);
     void emit_task(const std::string& event, const TaskSnapshot& task);
@@ -86,7 +87,9 @@ private:
     std::unordered_set<std::string> pending_resume_saves_;
     std::unordered_set<std::string> deferred_resume_saves_;
     std::unordered_set<std::string> pending_task_updates_;
+    std::unordered_set<std::string> resume_after_recheck_;
     std::unordered_map<std::string, std::chrono::steady_clock::time_point> metadata_started_;
+    std::unordered_map<std::string, std::chrono::steady_clock::time_point> next_payload_probe_;
     std::filesystem::path state_path_;
     EngineConfig config_;
     std::string user_agent_;

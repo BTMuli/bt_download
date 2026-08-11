@@ -41,6 +41,7 @@ namespace {
 
 constexpr auto resume_save_interval = std::chrono::seconds(30);
 constexpr auto final_resume_timeout = std::chrono::seconds(10);
+constexpr auto payload_probe_interval = std::chrono::seconds(1);
 constexpr std::uintmax_t max_resume_file_bytes = 64U * 1024U * 1024U;
 constexpr std::size_t max_detail_files = 2000;
 constexpr std::size_t max_detail_peers = 500;
@@ -94,6 +95,24 @@ std::filesystem::path path_from_utf8(std::string_view value) {
 #else
     return std::filesystem::u8path(value);
 #endif
+}
+
+bool payload_is_missing(const TaskSnapshot& task, const lt::torrent_handle& handle) {
+    const auto info = handle.torrent_file();
+    if (!info) return false;
+
+    for (lt::file_index_t index{0}; index < info->files().end_file(); ++index) {
+        if (info->files().pad_file_at(index)) continue;
+        const auto expected_size = info->files().file_size(index);
+        if (expected_size < 0) return true;
+
+        const auto path = task.save_path / path_from_utf8(info->files().file_path(index));
+        std::error_code error;
+        if (!std::filesystem::is_regular_file(path, error) || error) return true;
+        const auto actual_size = std::filesystem::file_size(path, error);
+        if (error || actual_size != static_cast<std::uintmax_t>(expected_size)) return true;
+    }
+    return false;
 }
 
 std::string hash_string(const lt::info_hash_t& hashes) {
@@ -765,18 +784,51 @@ nlohmann::json Engine::resume_task(const nlohmann::json& params) {
 
 nlohmann::json Engine::retry_task(const nlohmann::json& params) { return resume_task(params); }
 
+void Engine::start_recheck_locked(TaskSnapshot& task, lt::torrent_handle& handle) {
+    const bool was_completed = task.state == TaskState::completed;
+    if (was_completed) {
+        handle.pause();
+        // libtorrent may keep a completed, paused torrent in the auto-managed
+        // queue. Take it out of that queue while the explicit recheck starts,
+        // otherwise the asynchronous check can remain paused indefinitely.
+        handle.unset_flags(lt::torrent_flags::auto_managed);
+    }
+    // Drop peer entries retained from the previous complete/seeding session.
+    // Rechecking is a new download attempt; keeping the old reconnect backoff
+    // can prevent the freshly announced seed from being tried again.
+    handle.clear_peers();
+    handle.force_recheck();
+    // A completed handle can retain upload-only state from its previous
+    // lifecycle. Rechecking is an explicit request to make missing data
+    // downloadable again, so clear that mode first.
+    handle.unset_flags(lt::torrent_flags::upload_mode);
+    // A completed task is paused after its seeding limit is reached. Resume it
+    // immediately so libtorrent can run the asynchronous check. Auto-managed
+    // mode is restored after the check has completed.
+    if (was_completed) {
+        handle.resume();
+        resume_after_recheck_.insert(task.id);
+    } else {
+        handle.set_flags(lt::torrent_flags::auto_managed);
+    }
+    task.state = TaskState::checking;
+    // A stop reason belongs to the previous complete payload. Keeping it while
+    // rechecking missing data would make update_snapshots_locked turn the task
+    // back into completed before it can download the missing pieces.
+    task.seed_stop_reason.reset();
+    task.last_error.reset();
+    request_resume_save_locked(task.id, false);
+    persist_catalog_locked();
+    emit_task("event.taskUpdated", task);
+}
+
 nlohmann::json Engine::recheck_task(const nlohmann::json& params) {
     std::scoped_lock lock(mutex_);
     require_initialized();
     auto& task = require_task_locked(params.at("id").get<std::string>());
     const auto handle = handles_.find(task.id);
     if (handle == handles_.end()) fail(-32005, "TASK_UNAVAILABLE", "task has no active torrent handle", true);
-    handle->second.force_recheck();
-    task.state = TaskState::checking;
-    task.last_error.reset();
-    request_resume_save_locked(task.id, false);
-    persist_catalog_locked();
-    emit_task("event.taskUpdated", task);
+    start_recheck_locked(task, handle->second);
     return {{"task", task}};
 }
 
@@ -797,7 +849,9 @@ nlohmann::json Engine::remove_task(const nlohmann::json& params) {
     pending_resume_saves_.erase(id);
     deferred_resume_saves_.erase(id);
     pending_task_updates_.erase(id);
+    resume_after_recheck_.erase(id);
     metadata_started_.erase(id);
+    next_payload_probe_.erase(id);
     file_priorities_.erase(id);
     tasks_.erase(id);
     std::error_code resume_error;
@@ -836,6 +890,8 @@ void Engine::finalize_locked() {
     pending_resume_saves_.clear();
     deferred_resume_saves_.clear();
     metadata_started_.clear();
+    resume_after_recheck_.clear();
+    next_payload_probe_.clear();
     file_priorities_.clear();
     handles_.clear();
     session_.reset();
@@ -1198,6 +1254,31 @@ bool Engine::update_snapshots_locked(bool emit_events) {
             }
         }
         const auto status = handle.status(lt::torrent_handle::query_name);
+        bool checking = status.state == lt::torrent_status::checking_files
+            || status.state == lt::torrent_status::checking_resume_data;
+#if TORRENT_ABI_VERSION == 1
+        checking = checking || status.state == lt::torrent_status::queued_for_checking;
+#endif
+        if (resume_after_recheck_.contains(id) && !checking) {
+            handle.set_flags(lt::torrent_flags::auto_managed);
+            resume_after_recheck_.erase(id);
+            continue;
+        }
+        if (task.state == TaskState::seeding
+            && (status.state == lt::torrent_status::finished || status.state == lt::torrent_status::seeding)) {
+            const auto now = std::chrono::steady_clock::now();
+            const auto probe = next_payload_probe_.find(id);
+            if (probe == next_payload_probe_.end() || now >= probe->second) {
+                next_payload_probe_[id] = now + payload_probe_interval;
+                if (payload_is_missing(task, handle)) {
+                    start_recheck_locked(task, handle);
+                    catalog_changed = true;
+                    continue;
+                }
+            }
+        } else {
+            next_payload_probe_.erase(id);
+        }
         const auto previous_state = task.state;
         const auto previous_downloaded = task.downloaded_bytes;
         const auto previous_uploaded = task.uploaded_bytes;
@@ -1244,6 +1325,13 @@ bool Engine::update_snapshots_locked(bool emit_events) {
 
         const bool state_changed = next_state != previous_state;
         task.state = next_state;
+        if (previous_state == TaskState::checking
+            && (task.state == TaskState::downloading || task.state == TaskState::seeding)) {
+            // force_recheck stops announcing while it queues the check. Start a
+            // fresh announce once the payload state is known so a repaired task
+            // can find peers without waiting for the tracker's next interval.
+            handle.force_reannounce(0, -1, lt::torrent_handle::ignore_min_interval);
+        }
         if (task.state == TaskState::completed
             && (previous_state != TaskState::completed
                 || (handle.flags() & lt::torrent_flags::paused) == lt::torrent_flags_t{})) {
