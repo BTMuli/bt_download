@@ -503,9 +503,9 @@ nlohmann::json Engine::task_overview_locked(const std::string& id) {
     }
     overview["completedPieces"] = std::move(completed_pieces);
     overview["totalFiles"] = static_cast<std::uint64_t>(info->num_files());
-    std::vector<lt::peer_info> peers;
-    handle.get_peer_info(peers);
-    overview["totalPeers"] = peers.size();
+    // 概览只需要连接数；完整 Peer 列表由 task.peers 按需提供。
+    overview["totalPeers"] = static_cast<std::uint64_t>(
+        std::max(0, status.num_peers));
     return overview;
 }
 
