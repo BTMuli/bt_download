@@ -115,7 +115,9 @@ void run_tabbed_details_tests() {
         task_id = added.at("task").at("id").get<std::string>();
 
         const auto details = engine.dispatch("task.details", {{"id", task_id}});
-        expect(details.at("totalFiles") == 2, "1.2 overview did not report the file count");
+        expect(details.at("totalFiles") == 2
+                && details.at("contentFiles") == 2,
+            "1.2 overview did not report the file count");
         expect(details.at("totalPeers") == 0, "1.2 overview did not report the peer count");
         expect(details.at("files") == nlohmann::json::array(),
             "1.2 task.details must not carry the file list");
@@ -125,12 +127,16 @@ void run_tabbed_details_tests() {
         const auto all_files = dispatch_rpc(engine, "task.files", {{"id", task_id}});
         const auto& files = all_files.at("result").at("files");
         expect(files.size() == 2 && files[0].at("path") == "multi\\keep.bin"
-                && files[1].at("path") == "multi\\skip.bin",
+                && files[1].at("path") == "multi\\skip.bin"
+                && files[0].at("isPadding") == false
+                && files[1].at("isPadding") == false,
             "task.files returned the wrong file list");
         expect(all_files.at("result").at("filesTruncated") == false,
             "default file page must not be truncated");
         expect(all_files.at("result").at("totalFiles") == 2,
             "task.files reported the wrong total");
+        expect(all_files.at("result").at("contentFiles") == 2,
+            "task.files reported the wrong content total");
         expect(all_files.at("result").at("nextOffset").is_null(),
             "complete file page must not expose nextOffset");
 

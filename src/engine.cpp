@@ -489,6 +489,7 @@ nlohmann::json Engine::task_overview_locked(const std::string& id) {
         {"pieceCount", 0},
         {"completedPieces", ""},
         {"totalFiles", 0},
+        {"contentFiles", 0},
         {"totalPeers", 0},
     };
     if (!info) return overview;
@@ -503,6 +504,11 @@ nlohmann::json Engine::task_overview_locked(const std::string& id) {
     }
     overview["completedPieces"] = std::move(completed_pieces);
     overview["totalFiles"] = static_cast<std::uint64_t>(info->num_files());
+    std::size_t content_files = 0;
+    for (lt::file_index_t index{0}; index < info->files().end_file(); ++index) {
+        if (!info->files().pad_file_at(index)) ++content_files;
+    }
+    overview["contentFiles"] = static_cast<std::uint64_t>(content_files);
     // 概览只需要连接数；完整 Peer 列表由 task.peers 按需提供。
     overview["totalPeers"] = static_cast<std::uint64_t>(
         std::max(0, status.num_peers));
@@ -521,6 +527,7 @@ nlohmann::json Engine::task_files_locked(const std::string& id, std::size_t offs
         {"files", nlohmann::json::array()},
         {"filesTruncated", false},
         {"totalFiles", 0},
+        {"contentFiles", 0},
         {"offset", offset},
         {"nextOffset", nlohmann::json()},
     };
@@ -528,6 +535,11 @@ nlohmann::json Engine::task_files_locked(const std::string& id, std::size_t offs
 
     const auto total_files = static_cast<std::size_t>(info->num_files());
     result["totalFiles"] = total_files;
+    std::size_t content_files = 0;
+    for (lt::file_index_t index{0}; index < info->files().end_file(); ++index) {
+        if (!info->files().pad_file_at(index)) ++content_files;
+    }
+    result["contentFiles"] = content_files;
     if (offset >= total_files || limit == 0) return result;
 
     const auto file_progress = handle.file_progress(lt::torrent_handle::piece_granularity);
@@ -553,6 +565,7 @@ nlohmann::json Engine::task_files_locked(const std::string& id, std::size_t offs
             {"size", size},
             {"completedBytes", completed},
             {"priority", priority},
+            {"isPadding", info->files().pad_file_at(file_index)},
         });
     }
     result["filesTruncated"] = end < total_files;

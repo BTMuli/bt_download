@@ -85,7 +85,7 @@ Tracker 与做种配置示例：
 
 ## 文件选择与优先级
 
-文件项（由 `task.details` 或 `task.files` 返回）包含 `priority` 字段。`task.setFilePriorities` 按部分索引更新文件优先级，`priorities` 是文件索引到优先级的对象：
+文件项（由 `task.details` 或 `task.files` 返回）包含 `priority` 与 `isPadding` 字段。`isPadding=true` 表示 libtorrent 的对齐文件；它不对应实际下载文件，客户端应隐藏该项，但仍保留它在文件数组中的索引。`task.setFilePriorities` 按部分索引更新文件优先级，`priorities` 是文件索引到优先级的对象：
 
 ```json
 {"jsonrpc":"2.0","id":"3","method":"task.setFilePriorities","params":{"id":"...","priorities":{"0":4,"2":0}}}
@@ -100,14 +100,14 @@ Tracker 与做种配置示例：
 
 ## 下载详情按 Tab 拆分
 
-协议将 Peer/文件列表从 `task.details` 中拆出。概览响应不再携带大列表，文件与 Peer 数量以 `totalFiles` / `totalPeers` 提供，客户端可直接渲染 Tab 计数：
+协议将 Peer/文件列表从 `task.details` 中拆出。概览响应不再携带大列表，文件与 Peer 数量以 `totalFiles` / `contentFiles` / `totalPeers` 提供，客户端可直接渲染 Tab 计数。`totalFiles` 包含 padding 项，`contentFiles` 只统计真实文件；文件索引和分页仍以 `totalFiles` 为准：
 
 ```json
 {"jsonrpc":"2.0","id":"2","method":"task.details","params":{"id":"..."}}
 ```
 
 ```json
-{"id":"2","jsonrpc":"2.0","result":{"task":{...},"pieceLength":16384,"pieceCount":1024,"completedPieces":"0101...","totalFiles":42,"totalPeers":37,"files":[],"filesTruncated":false,"peers":[],"peersTruncated":false}}
+{"id":"2","jsonrpc":"2.0","result":{"task":{...},"pieceLength":16384,"pieceCount":1024,"completedPieces":"0101...","totalFiles":42,"contentFiles":31,"totalPeers":37,"files":[],"filesTruncated":false,"peers":[],"peersTruncated":false}}
 ```
 
 `task.files` / `task.peers` 使用相同的窗口语义：`offset` 默认 `0`，`limit` 默认分别是 `2000` 与 `500`（也是单次窗口上限）。`filesTruncated` / `peersTruncated` 表示当前窗口之后仍有数据；此时 `nextOffset` 为下一页起点，否则为 `null`：
@@ -117,7 +117,7 @@ Tracker 与做种配置示例：
 ```
 
 ```json
-{"id":"3","jsonrpc":"2.0","result":{"files":[{"path":"...","size":1048576,"completedBytes":524288,"priority":4}],"filesTruncated":true,"totalFiles":1200,"offset":0,"nextOffset":500}}
+{"id":"3","jsonrpc":"2.0","result":{"files":[{"path":"...","size":1048576,"completedBytes":524288,"priority":4,"isPadding":false}],"filesTruncated":true,"totalFiles":1200,"contentFiles":1000,"offset":0,"nextOffset":500}}
 ```
 
 - `offset` 必须是非负整数，`limit` 必须是 `1` 到窗口上限的整数，否则返回 `INVALID_PAGINATION`；
