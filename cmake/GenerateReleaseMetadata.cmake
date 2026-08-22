@@ -39,6 +39,8 @@ function(read_package_version package_name output_variable)
 endfunction()
 
 read_package_version("libtorrent" libtorrent_version)
+read_package_version("curl" curl_version)
+read_package_version("zlib" zlib_version)
 read_package_version("openssl" openssl_version)
 read_package_version("nlohmann-json" nlohmann_json_version)
 read_package_version("boost-headers" boost_version)
@@ -48,6 +50,8 @@ file(MAKE_DIRECTORY "${license_dir}")
 
 set(license_sources
     "libtorrent|${share_dir}/libtorrent/copyright"
+    "curl|${share_dir}/curl/copyright"
+    "zlib|${share_dir}/zlib/copyright"
     "openssl|${share_dir}/openssl/copyright"
     "nlohmann-json|${share_dir}/nlohmann-json/copyright"
     "boost|${share_dir}/boost-headers/copyright"
@@ -79,6 +83,8 @@ file(WRITE "${BT_RELEASE_DIR}/THIRD_PARTY_NOTICES.txt" "${notices}")
 set(required_release_files
     "bt_download.exe"
     "torrent-rasterbar.dll"
+    "libcurl.dll"
+    "z.dll"
     "libssl-3-x64.dll"
     "libcrypto-3-x64.dll"
 )
@@ -88,11 +94,19 @@ foreach(required_release_file IN LISTS required_release_files)
     endif()
 endforeach()
 
-file(GLOB release_files
-    RELATIVE "${BT_RELEASE_DIR}"
+file(GLOB release_paths
+    LIST_DIRECTORIES false
     "${BT_RELEASE_DIR}/*.exe"
     "${BT_RELEASE_DIR}/*.dll"
 )
+set(release_files "")
+foreach(release_path IN LISTS release_paths)
+    get_filename_component(release_file "${release_path}" NAME)
+    list(APPEND release_files "${release_file}")
+endforeach()
+if(NOT release_files)
+    message(FATAL_ERROR "No release executables or libraries were found in ${BT_RELEASE_DIR}")
+endif()
 list(SORT release_files)
 set(file_entries "")
 set(file_relationships "")
@@ -128,7 +142,7 @@ string(SHA1 package_verification_code "${package_verification_input}")
 
 string(TIMESTAMP created_at "%Y-%m-%dT%H:%M:%SZ" UTC)
 string(SHA256 namespace_hash
-    "bt_download-${BT_PROJECT_VERSION}-${BT_VCPKG_TRIPLET}-${package_verification_code}-${libtorrent_version}-${openssl_version}-${nlohmann_json_version}-${boost_version}-${created_at}"
+    "bt_download-${BT_PROJECT_VERSION}-${BT_VCPKG_TRIPLET}-${package_verification_code}-${libtorrent_version}-${curl_version}-${zlib_version}-${openssl_version}-${nlohmann_json_version}-${boost_version}-${created_at}"
 )
 
 set(sbom "{\n")
@@ -147,6 +161,8 @@ string(APPEND sbom
     "  \"packages\": [\n"
     "    {\"name\": \"bt_download\", \"SPDXID\": \"SPDXRef-Package-bt-download\", \"versionInfo\": \"${BT_PROJECT_VERSION}\", \"downloadLocation\": \"NOASSERTION\", \"filesAnalyzed\": true, \"packageVerificationCode\": {\"packageVerificationCodeValue\": \"${package_verification_code}\"}, \"licenseConcluded\": \"NOASSERTION\", \"licenseDeclared\": \"NOASSERTION\", \"copyrightText\": \"NOASSERTION\"},\n"
     "    {\"name\": \"libtorrent\", \"SPDXID\": \"SPDXRef-Package-libtorrent\", \"versionInfo\": \"${libtorrent_version}\", \"downloadLocation\": \"https://github.com/arvidn/libtorrent\", \"filesAnalyzed\": false, \"licenseConcluded\": \"BSD-2-Clause\", \"licenseDeclared\": \"BSD-2-Clause\", \"copyrightText\": \"NOASSERTION\"},\n"
+    "    {\"name\": \"curl\", \"SPDXID\": \"SPDXRef-Package-curl\", \"versionInfo\": \"${curl_version}\", \"downloadLocation\": \"https://curl.se/\", \"filesAnalyzed\": false, \"licenseConcluded\": \"curl\", \"licenseDeclared\": \"curl\", \"copyrightText\": \"NOASSERTION\"},\n"
+    "    {\"name\": \"zlib\", \"SPDXID\": \"SPDXRef-Package-zlib\", \"versionInfo\": \"${zlib_version}\", \"downloadLocation\": \"https://zlib.net/\", \"filesAnalyzed\": false, \"licenseConcluded\": \"Zlib\", \"licenseDeclared\": \"Zlib\", \"copyrightText\": \"NOASSERTION\"},\n"
     "    {\"name\": \"OpenSSL\", \"SPDXID\": \"SPDXRef-Package-openssl\", \"versionInfo\": \"${openssl_version}\", \"downloadLocation\": \"https://github.com/openssl/openssl\", \"filesAnalyzed\": false, \"licenseConcluded\": \"Apache-2.0\", \"licenseDeclared\": \"Apache-2.0\", \"copyrightText\": \"NOASSERTION\"},\n"
     "    {\"name\": \"nlohmann-json\", \"SPDXID\": \"SPDXRef-Package-nlohmann-json\", \"versionInfo\": \"${nlohmann_json_version}\", \"downloadLocation\": \"https://github.com/nlohmann/json\", \"filesAnalyzed\": false, \"licenseConcluded\": \"MIT\", \"licenseDeclared\": \"MIT\", \"copyrightText\": \"NOASSERTION\"},\n"
     "    {\"name\": \"Boost\", \"SPDXID\": \"SPDXRef-Package-boost\", \"versionInfo\": \"${boost_version}\", \"downloadLocation\": \"https://github.com/boostorg/boost\", \"filesAnalyzed\": false, \"licenseConcluded\": \"BSL-1.0\", \"licenseDeclared\": \"BSL-1.0\", \"copyrightText\": \"NOASSERTION\"},\n"
@@ -156,12 +172,16 @@ string(APPEND sbom
     "  \"relationships\": [\n"
     "    {\"spdxElementId\": \"SPDXRef-DOCUMENT\", \"relationshipType\": \"DESCRIBES\", \"relatedSpdxElement\": \"SPDXRef-Package-bt-download\"},\n"
     "    {\"spdxElementId\": \"SPDXRef-Package-bt-download\", \"relationshipType\": \"DEPENDS_ON\", \"relatedSpdxElement\": \"SPDXRef-Package-libtorrent\"},\n"
+    "    {\"spdxElementId\": \"SPDXRef-Package-bt-download\", \"relationshipType\": \"DEPENDS_ON\", \"relatedSpdxElement\": \"SPDXRef-Package-curl\"},\n"
     "    {\"spdxElementId\": \"SPDXRef-Package-bt-download\", \"relationshipType\": \"DEPENDS_ON\", \"relatedSpdxElement\": \"SPDXRef-Package-nlohmann-json\"},\n"
     "    {\"spdxElementId\": \"SPDXRef-Package-bt-download\", \"relationshipType\": \"DEPENDS_ON\", \"relatedSpdxElement\": \"SPDXRef-Package-msvc-runtime\"},\n"
     "    {\"spdxElementId\": \"SPDXRef-Package-libtorrent\", \"relationshipType\": \"DEPENDS_ON\", \"relatedSpdxElement\": \"SPDXRef-Package-openssl\"},\n"
     "    {\"spdxElementId\": \"SPDXRef-Package-libtorrent\", \"relationshipType\": \"DEPENDS_ON\", \"relatedSpdxElement\": \"SPDXRef-Package-boost\"},\n"
+    "    {\"spdxElementId\": \"SPDXRef-Package-curl\", \"relationshipType\": \"DEPENDS_ON\", \"relatedSpdxElement\": \"SPDXRef-Package-zlib\"},\n"
     "${file_relationships}"
     "    {\"spdxElementId\": \"SPDXRef-File-torrent_rasterbar_dll\", \"relationshipType\": \"GENERATED_FROM\", \"relatedSpdxElement\": \"SPDXRef-Package-libtorrent\"},\n"
+    "    {\"spdxElementId\": \"SPDXRef-File-libcurl_dll\", \"relationshipType\": \"GENERATED_FROM\", \"relatedSpdxElement\": \"SPDXRef-Package-curl\"},\n"
+    "    {\"spdxElementId\": \"SPDXRef-File-z_dll\", \"relationshipType\": \"GENERATED_FROM\", \"relatedSpdxElement\": \"SPDXRef-Package-zlib\"},\n"
     "    {\"spdxElementId\": \"SPDXRef-File-libssl_3_x64_dll\", \"relationshipType\": \"GENERATED_FROM\", \"relatedSpdxElement\": \"SPDXRef-Package-openssl\"},\n"
     "    {\"spdxElementId\": \"SPDXRef-File-libcrypto_3_x64_dll\", \"relationshipType\": \"GENERATED_FROM\", \"relatedSpdxElement\": \"SPDXRef-Package-openssl\"}\n"
     "  ]\n"

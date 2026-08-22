@@ -107,7 +107,7 @@ void run_tabbed_details_tests() {
     {
         bt::Engine engine([](const std::string&, const nlohmann::json&) {});
         engine.dispatch("engine.initialize", {
-            {"protocolVersion", "1.2"}, {"statePath", path_utf8(state_path)}});
+            {"protocolVersion", "1.4"}, {"statePath", path_utf8(state_path)}});
 
         const auto added = engine.dispatch("task.add", {
             {"source", {{"kind", "torrentFile"}, {"path", path_utf8(torrent_path)}}},
@@ -117,12 +117,12 @@ void run_tabbed_details_tests() {
         const auto details = engine.dispatch("task.details", {{"id", task_id}});
         expect(details.at("totalFiles") == 2
                 && details.at("contentFiles") == 2,
-            "1.2 overview did not report the file count");
-        expect(details.at("totalPeers") == 0, "1.2 overview did not report the peer count");
+            "1.4 overview did not report the file count");
+        expect(details.at("totalPeers") == 0, "1.4 overview did not report the peer count");
         expect(details.at("files") == nlohmann::json::array(),
-            "1.2 task.details must not carry the file list");
+            "1.4 task.details must not carry the file list");
         expect(details.at("peers") == nlohmann::json::array(),
-            "1.2 task.details must not carry the peer list");
+            "1.4 task.details must not carry the peer list");
 
         const auto all_files = dispatch_rpc(engine, "task.files", {{"id", task_id}});
         const auto& files = all_files.at("result").at("files");

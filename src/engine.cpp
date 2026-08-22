@@ -45,8 +45,54 @@ constexpr auto payload_probe_interval = std::chrono::seconds(1);
 constexpr std::uintmax_t max_resume_file_bytes = 64U * 1024U * 1024U;
 constexpr std::size_t max_detail_files = 2000;
 constexpr std::size_t max_detail_peers = 500;
+constexpr std::uint64_t http_progress_piece_min_bytes = 256U * 1024U;
+constexpr std::uint64_t http_progress_piece_max_count = 256;
 constexpr std::string_view default_user_agent = "bt_download/" BT_DOWNLOAD_VERSION;
 constexpr std::size_t max_user_agent_bytes = 255;
+
+struct HttpProgressPieces {
+    std::uint64_t piece_length{0};
+    std::uint64_t piece_count{0};
+    std::string completed_pieces;
+};
+
+std::uint64_t divide_rounding_up(std::uint64_t value, std::uint64_t divisor) {
+    return value / divisor + (value % divisor == 0 ? 0 : 1);
+}
+
+HttpProgressPieces http_progress_pieces(const TaskSnapshot& task,
+    const HttpTransferProgress* transfer_progress = nullptr) {
+    if (task.total_bytes == 0) return {};
+
+    HttpProgressPieces result;
+    result.piece_length = std::max(http_progress_piece_min_bytes,
+        divide_rounding_up(task.total_bytes, http_progress_piece_max_count));
+    result.piece_count = divide_rounding_up(task.total_bytes, result.piece_length);
+    result.completed_pieces.reserve(static_cast<std::size_t>(result.piece_count));
+
+    const auto downloaded = std::min(task.downloaded_bytes, task.total_bytes);
+    for (std::uint64_t index = 0; index < result.piece_count; ++index) {
+        const auto start = index * result.piece_length;
+        const auto end = index + 1 == result.piece_count
+            ? task.total_bytes
+            : result.piece_length * (index + 1);
+        bool complete = downloaded >= end;
+        if (transfer_progress != nullptr && !transfer_progress->ranges.empty()) {
+            auto covered_until = start;
+            for (const auto& range : transfer_progress->ranges) {
+                const auto range_end = range.start
+                    + std::min(range.downloaded, range.end - range.start);
+                if (range_end <= covered_until) continue;
+                if (range.start > covered_until) break;
+                covered_until = range_end;
+                if (covered_until >= end) break;
+            }
+            complete = covered_until >= end;
+        }
+        result.completed_pieces.push_back(complete ? '1' : '0');
+    }
+    return result;
+}
 
 std::optional<std::uint64_t> page_value(const nlohmann::json& value) {
     if (!value.is_number_integer()) return std::nullopt;
@@ -95,6 +141,14 @@ std::filesystem::path path_from_utf8(std::string_view value) {
 #else
     return std::filesystem::u8path(value);
 #endif
+}
+
+std::string suffixed_file_name(const std::string& value, std::size_t suffix) {
+    if (suffix == 0) return value;
+    const auto path = path_from_utf8(value);
+    const auto stem = path_utf8(path.stem());
+    const auto extension = path_utf8(path.extension());
+    return stem + " (" + std::to_string(suffix) + ")" + extension;
 }
 
 bool payload_is_missing(const TaskSnapshot& task, const lt::torrent_handle& handle) {
@@ -160,7 +214,8 @@ bool replace_file(const std::filesystem::path& temporary, const std::filesystem:
 #endif
 }
 
-lt::settings_pack make_settings(const EngineConfig& config, const std::string& user_agent) {
+lt::settings_pack make_settings(const EngineConfig& config,
+    const EngineProxyConfig& proxy, const std::string& user_agent) {
     lt::settings_pack settings;
     settings.set_int(lt::settings_pack::active_downloads, config.active_downloads);
     settings.set_int(lt::settings_pack::active_limit, -1);
@@ -171,10 +226,30 @@ lt::settings_pack make_settings(const EngineConfig& config, const std::string& u
     settings.set_str(lt::settings_pack::user_agent, user_agent);
     const auto alert_mask = lt::alert_category::error | lt::alert_category::storage;
     settings.set_int(lt::settings_pack::alert_mask, static_cast<int>(static_cast<std::uint32_t>(alert_mask)));
-    settings.set_bool(lt::settings_pack::enable_dht, true);
-    settings.set_bool(lt::settings_pack::enable_lsd, true);
-    settings.set_bool(lt::settings_pack::enable_upnp, true);
-    settings.set_bool(lt::settings_pack::enable_natpmp, true);
+    const bool proxy_enabled = proxy.enabled && proxy.peer_proxy.has_value();
+    if (proxy_enabled) {
+        const auto& endpoint = *proxy.peer_proxy;
+        settings.set_str(lt::settings_pack::proxy_hostname, endpoint.host);
+        settings.set_int(lt::settings_pack::proxy_port, endpoint.port);
+        settings.set_str(lt::settings_pack::proxy_username, endpoint.username);
+        settings.set_str(lt::settings_pack::proxy_password, endpoint.password);
+        settings.set_int(lt::settings_pack::proxy_type,
+            endpoint.username.empty() && endpoint.password.empty()
+                ? lt::settings_pack::http : lt::settings_pack::http_pw);
+        settings.set_bool(lt::settings_pack::proxy_hostnames, true);
+        settings.set_bool(lt::settings_pack::proxy_peer_connections, true);
+        settings.set_bool(lt::settings_pack::proxy_tracker_connections, true);
+    } else {
+        settings.set_str(lt::settings_pack::proxy_hostname, "");
+        settings.set_int(lt::settings_pack::proxy_port, 0);
+        settings.set_str(lt::settings_pack::proxy_username, "");
+        settings.set_str(lt::settings_pack::proxy_password, "");
+        settings.set_int(lt::settings_pack::proxy_type, lt::settings_pack::none);
+    }
+    settings.set_bool(lt::settings_pack::enable_dht, !proxy_enabled);
+    settings.set_bool(lt::settings_pack::enable_lsd, !proxy_enabled);
+    settings.set_bool(lt::settings_pack::enable_upnp, !proxy_enabled);
+    settings.set_bool(lt::settings_pack::enable_natpmp, !proxy_enabled);
     settings.set_bool(lt::settings_pack::auto_sequential, false);
     return settings;
 }
@@ -208,6 +283,7 @@ nlohmann::json Engine::dispatch(const std::string& method, const nlohmann::json&
     if (method == "engine.initialize") return initialize(params);
     if (method == "engine.status") return status();
     if (method == "engine.configure") return configure(params);
+    if (method == "engine.configureProxy") return configure_proxy(params);
     if (method == "engine.shutdown") return shutdown();
     if (method == "task.add") return add_task(params);
     if (method == "task.list") return list_tasks();
@@ -265,7 +341,14 @@ nlohmann::json Engine::initialize(const nlohmann::json& params) {
             fail(-32602, "INVALID_CONFIG", exception.what());
         }
     }
-    session_ = std::make_unique<lt::session>(make_settings(config_, user_agent_));
+    if (params.contains("proxy")) {
+        try {
+            proxy_ = parse_proxy_config(params.at("proxy"));
+        } catch (const std::invalid_argument& exception) {
+            fail(-32602, "INVALID_PROXY", exception.what());
+        }
+    }
+    session_ = std::make_unique<lt::session>(make_settings(config_, proxy_, user_agent_));
     apply_local_rate_limits(*session_, config_);
     initialized_ = true;
     load_catalog_locked();
@@ -279,7 +362,7 @@ nlohmann::json Engine::initialize(const nlohmann::json& params) {
             initialized_ = false;
             fail(-32602, "INVALID_CONFIG", exception.what());
         }
-        session_->apply_settings(make_settings(config_, user_agent_));
+        session_->apply_settings(make_settings(config_, proxy_, user_agent_));
         apply_local_rate_limits(*session_, config_);
         apply_additional_trackers_to_all_locked(false);
         persist_catalog_locked();
@@ -288,8 +371,9 @@ nlohmann::json Engine::initialize(const nlohmann::json& params) {
     worker_ = std::jthread([this](std::stop_token token) { worker_loop(token); });
     return {{"protocolVersion", BT_DOWNLOAD_PROTOCOL_VERSION}, {"engineVersion", BT_DOWNLOAD_VERSION},
             {"libtorrentVersion", LIBTORRENT_VERSION}, {"restoredTasks", tasks_.size()},
-            {"features", nlohmann::json::array({"additionalTrackers", "limitedSeeding", "taskDetails", "tabbedDetails"})},
-            {"config", config_json(config_)}};
+            {"features", nlohmann::json::array({"additionalTrackers", "limitedSeeding",
+                "taskDetails", "tabbedDetails", "httpDownloads", "httpMultiConnection", "systemProxy"})},
+            {"config", config_json(config_)}, {"proxy", proxy_status_json(proxy_)}};
 }
 
 nlohmann::json Engine::status() const {
@@ -303,8 +387,9 @@ nlohmann::json Engine::status() const {
     return {{"initialized", initialized_}, {"protocolVersion", BT_DOWNLOAD_PROTOCOL_VERSION},
             {"engineVersion", BT_DOWNLOAD_VERSION}, {"libtorrentVersion", LIBTORRENT_VERSION},
             {"uptimeSeconds", uptime}, {"taskCount", tasks_.size()}, {"activeTasks", active},
-            {"features", nlohmann::json::array({"additionalTrackers", "limitedSeeding", "taskDetails", "tabbedDetails"})},
-            {"config", config_json(config_)}};
+            {"features", nlohmann::json::array({"additionalTrackers", "limitedSeeding",
+                "taskDetails", "tabbedDetails", "httpDownloads", "httpMultiConnection", "systemProxy"})},
+            {"config", config_json(config_)}, {"proxy", proxy_status_json(proxy_)}};
 }
 
 nlohmann::json Engine::configure(const nlohmann::json& params) {
@@ -315,12 +400,41 @@ nlohmann::json Engine::configure(const nlohmann::json& params) {
     } catch (const std::invalid_argument& exception) {
         fail(-32602, "INVALID_CONFIG", exception.what());
     }
-    session_->apply_settings(make_settings(config_, user_agent_));
+    session_->apply_settings(make_settings(config_, proxy_, user_agent_));
     apply_local_rate_limits(*session_, config_);
+    apply_shared_download_budget_locked();
     apply_additional_trackers_to_all_locked(true);
     update_snapshots_locked(true);
     persist_catalog_locked();
     return {{"config", config_json(config_)}};
+}
+
+nlohmann::json Engine::configure_proxy(const nlohmann::json& params) {
+    std::scoped_lock lock(mutex_);
+    require_initialized();
+    EngineProxyConfig next;
+    try {
+        next = parse_proxy_config(params);
+    } catch (const std::invalid_argument& exception) {
+        fail(-32602, "INVALID_PROXY", exception.what());
+    }
+
+    for (auto& [id, task] : tasks_) {
+        if (task.source_kind != "http" || !http_downloads_.contains(id)) continue;
+        http_downloads_.cancel(id);
+        task.state = TaskState::queued;
+        task.download_rate = 0;
+        task.last_error.reset();
+        emit_task("event.taskUpdated", task);
+    }
+    proxy_ = std::move(next);
+    session_->pause();
+    session_->apply_settings(make_settings(config_, proxy_, user_agent_));
+    session_->resume();
+    apply_local_rate_limits(*session_, config_);
+    schedule_http_tasks_locked();
+    apply_shared_download_budget_locked();
+    return {{"proxy", proxy_status_json(proxy_)}};
 }
 
 bool Engine::effective_seeding_enabled() const noexcept {
@@ -372,6 +486,193 @@ void Engine::apply_additional_trackers_to_all_locked(bool reannounce) {
     }
 }
 
+void Engine::apply_shared_download_budget_locked() {
+    if (!session_) return;
+    const auto active_http = static_cast<int>(std::min<std::size_t>(
+        http_downloads_.active_count(), static_cast<std::size_t>(config_.active_downloads)));
+    lt::settings_pack settings;
+    settings.set_int(lt::settings_pack::active_downloads,
+        std::max(0, config_.active_downloads - active_http));
+    session_->apply_settings(settings);
+}
+
+std::filesystem::path Engine::http_target_path_locked(const std::string& id) const {
+    const auto task = tasks_.find(id);
+    const auto file_name = http_file_names_.find(id);
+    if (task == tasks_.end() || file_name == http_file_names_.end()) {
+        throw std::runtime_error("HTTP task target is unavailable");
+    }
+    return task->second.save_path / path_from_utf8(file_name->second);
+}
+
+std::filesystem::path Engine::http_partial_path_locked(const std::string& id) const {
+    auto path = http_target_path_locked(id);
+    path += path_from_utf8("." + id + ".part");
+    return path;
+}
+
+std::string Engine::reserve_http_file_name_locked(const std::filesystem::path& save_path,
+    const std::string& suggested) const {
+    for (std::size_t suffix = 0; suffix < 10000; ++suffix) {
+        const auto candidate = suffixed_file_name(suggested, suffix);
+        bool reserved = false;
+        for (const auto& [id, file_name] : http_file_names_) {
+            const auto task = tasks_.find(id);
+            if (task != tasks_.end() && task->second.save_path == save_path
+                && file_name == candidate) {
+                reserved = true;
+                break;
+            }
+        }
+        if (reserved) continue;
+        std::error_code error;
+        if (!std::filesystem::exists(save_path / path_from_utf8(candidate), error) && !error) {
+            return candidate;
+        }
+    }
+    fail(-32010, "TARGET_FILE_EXISTS", "cannot reserve a unique HTTP target filename");
+}
+
+bool Engine::schedule_http_tasks_locked() {
+    std::size_t active_torrents = 0;
+    for (const auto& [id, task] : tasks_) {
+        (void)id;
+        if (task.source_kind == "http") continue;
+        if (task.state == TaskState::metadata || task.state == TaskState::checking
+            || task.state == TaskState::downloading) {
+            ++active_torrents;
+        }
+    }
+    auto active = active_torrents + http_downloads_.active_count();
+    const auto limit = static_cast<std::size_t>(config_.active_downloads);
+    bool changed = false;
+    for (auto& [id, task] : tasks_) {
+        if (active >= limit) break;
+        if (task.source_kind != "http" || task.state != TaskState::queued
+            || http_downloads_.contains(id)) {
+            continue;
+        }
+        std::optional<HttpTransferFailure> failure;
+        std::error_code target_error;
+        if (std::filesystem::exists(http_target_path_locked(id), target_error)) {
+            failure = HttpTransferFailure{
+                "TARGET_FILE_EXISTS", "HTTP target file already exists", false, false};
+        } else if (target_error) {
+            failure = HttpTransferFailure{"SAVE_PATH_UNAVAILABLE",
+                "cannot inspect HTTP target path: " + target_error.message(), true, false};
+        } else {
+            failure = http_downloads_.start(
+                id, task.source, http_partial_path_locked(id), user_agent_,
+                static_cast<std::size_t>(config_.connections_per_task), proxy_);
+        }
+        if (failure) {
+            task.state = TaskState::error;
+            task.download_rate = 0;
+            task.last_error = TaskError{failure->code, failure->message, failure->retryable};
+        } else {
+            task.state = TaskState::downloading;
+            task.last_error.reset();
+            ++active;
+        }
+        emit_task("event.taskUpdated", task);
+        changed = true;
+    }
+    apply_shared_download_budget_locked();
+    return changed;
+}
+
+bool Engine::update_http_tasks_locked(bool emit_events) {
+    bool catalog_changed = false;
+    for (auto update : http_downloads_.poll(config_.download_rate_limit)) {
+        const auto found = tasks_.find(update.id);
+        if (found == tasks_.end()) continue;
+        auto& task = found->second;
+        const auto previous_state = task.state;
+        const auto previous_total = task.total_bytes;
+        const auto previous_downloaded = task.downloaded_bytes;
+        const auto previous_rate = task.download_rate;
+        if (update.total_bytes > 0) task.total_bytes = update.total_bytes;
+        task.downloaded_bytes = update.downloaded_bytes;
+        task.download_rate = update.download_rate;
+
+        if (update.finished && update.succeeded) {
+            const auto partial = http_partial_path_locked(update.id);
+            const auto target = http_target_path_locked(update.id);
+            std::error_code error;
+            if (std::filesystem::exists(target, error) || error) {
+                task.state = TaskState::error;
+                task.download_rate = 0;
+                task.last_error = TaskError{
+                    "TARGET_FILE_EXISTS", "HTTP target file already exists", false};
+            } else {
+                const auto size = std::filesystem::file_size(partial, error);
+                if (error) {
+                    task.state = TaskState::error;
+                    task.download_rate = 0;
+                    task.last_error = TaskError{
+                        "STORAGE_ERROR", "cannot read completed HTTP file size: " + error.message(), true};
+                } else {
+                    std::filesystem::rename(partial, target, error);
+                    if (error) {
+                        task.state = TaskState::error;
+                        task.download_rate = 0;
+                        task.last_error = TaskError{
+                            "STORAGE_ERROR", "cannot finalize HTTP file: " + error.message(), true};
+                    } else {
+                        task.total_bytes = static_cast<std::uint64_t>(size);
+                        task.downloaded_bytes = task.total_bytes;
+                        task.verified_bytes = task.total_bytes;
+                        task.download_rate = 0;
+                        task.state = TaskState::completed;
+                        task.last_error.reset();
+                        std::error_code state_error;
+                        remove_http_transfer_state(partial, state_error);
+                    }
+                }
+            }
+        } else if (update.finished && update.failure) {
+            if (update.failure->restart_without_range) {
+                std::error_code error;
+                std::filesystem::remove(http_partial_path_locked(update.id), error);
+                if (!error) {
+                    remove_http_transfer_state(
+                        http_partial_path_locked(update.id), error);
+                }
+                if (error) {
+                    task.state = TaskState::error;
+                    task.last_error = TaskError{
+                        "STORAGE_ERROR", "cannot reset HTTP partial file: " + error.message(), true};
+                } else {
+                    task.state = TaskState::queued;
+                    task.total_bytes = 0;
+                    task.downloaded_bytes = 0;
+                    task.verified_bytes = 0;
+                    task.last_error.reset();
+                }
+            } else {
+                task.state = TaskState::error;
+                task.last_error = TaskError{
+                    update.failure->code, update.failure->message, update.failure->retryable};
+            }
+            task.download_rate = 0;
+        }
+
+        const bool state_changed = task.state != previous_state;
+        const bool progress_changed = task.total_bytes != previous_total
+            || task.downloaded_bytes != previous_downloaded
+            || task.download_rate != previous_rate;
+        if (state_changed || progress_changed) {
+            if (emit_events) emit_task("event.taskUpdated", task);
+            else pending_task_updates_.insert(update.id);
+        } else if (emit_events && pending_task_updates_.contains(update.id)) {
+            emit_task("event.taskUpdated", task);
+        }
+        catalog_changed = catalog_changed || state_changed;
+    }
+    apply_shared_download_budget_locked();
+    return catalog_changed;
+}
+
 nlohmann::json Engine::add_task(const nlohmann::json& params) {
     std::scoped_lock lock(mutex_);
     require_initialized();
@@ -380,11 +681,49 @@ nlohmann::json Engine::add_task(const nlohmann::json& params) {
     std::string source;
     if (kind == "torrentFile") source = source_json.at("path").get<std::string>();
     else if (kind == "magnet") source = source_json.at("uri").get<std::string>();
-    else fail(-32602, "SOURCE_UNSUPPORTED", "source.kind must be torrentFile or magnet");
+    else if (kind == "http") {
+        const auto normalized = normalize_http_url(source_json.at("url").get<std::string>());
+        if (!normalized) fail(-32010, "SOURCE_INVALID", "invalid HTTP(S) URL");
+        source = *normalized;
+    }
+    else fail(-32602, "SOURCE_UNSUPPORTED", "source.kind must be torrentFile, magnet, or http");
     if (source.size() > max_frame_bytes / 2) fail(-32602, "SOURCE_TOO_LARGE", "source is too large");
 
     const auto save_validation = validate_save_path(path_from_utf8(params.at("savePath").get<std::string>()));
     if (!save_validation.valid) fail(-32010, save_validation.error_code, save_validation.message);
+    const bool start = params.value("start", true);
+
+    if (kind == "http") {
+        std::error_code error;
+        for (const auto& [id, existing] : tasks_) {
+            if (existing.source_kind != "http" || existing.source != source) continue;
+            const bool same_path = std::filesystem::equivalent(
+                existing.save_path, save_validation.normalized, error);
+            error.clear();
+            if (same_path) {
+                fail(-32011, "DUPLICATE_TASK", "the HTTP URL already exists at this save path",
+                    false, {{"taskId", id}, {"savePath", path_utf8(existing.save_path)}});
+            }
+        }
+
+        TaskSnapshot task;
+        task.id = new_task_id();
+        task.state = start ? TaskState::queued : TaskState::paused;
+        task.source_kind = kind;
+        task.source = source;
+        task.save_path = save_validation.normalized;
+        const auto file_name = reserve_http_file_name_locked(
+            task.save_path, http_file_name_from_url(source));
+        task.display_name = params.value("displayName", std::string{});
+        if (task.display_name.empty()) task.display_name = file_name;
+        const auto id = task.id;
+        tasks_.emplace(id, task);
+        http_file_names_.emplace(id, file_name);
+        persist_catalog_locked();
+        emit_task("event.taskAdded", tasks_.at(id));
+        if (start && schedule_http_tasks_locked()) persist_catalog_locked();
+        return {{"task", tasks_.at(id)}};
+    }
 
     lt::error_code error;
     lt::add_torrent_params add;
@@ -423,7 +762,6 @@ nlohmann::json Engine::add_task(const nlohmann::json& params) {
     }
     add.save_path = path_utf8(save_validation.normalized);
     add.max_connections = config_.connections_per_task;
-    const bool start = params.value("start", true);
     add.flags |= lt::torrent_flags::paused;
 
     for (const auto& [id, task] : tasks_) {
@@ -476,6 +814,24 @@ nlohmann::json Engine::get_task(const nlohmann::json& params) {
 
 nlohmann::json Engine::task_overview_locked(const std::string& id) {
     const auto& task = require_task_locked(id);
+    if (task.source_kind == "http") {
+        auto progress = http_downloads_.progress(id);
+        if (!progress) {
+            progress = read_http_transfer_progress(http_partial_path_locked(id));
+        }
+        const auto pieces = http_progress_pieces(
+            task, progress ? &*progress : nullptr);
+        return {
+            {"task", task},
+            {"pieceLength", pieces.piece_length},
+            {"pieceCount", pieces.piece_count},
+            {"completedPieces", pieces.completed_pieces},
+            {"totalFiles", 1},
+            {"contentFiles", 1},
+            {"totalPeers", 0},
+            {"httpConnections", progress ? progress->active_connections : 0},
+        };
+    }
     const auto found = handles_.find(id);
     if (found == handles_.end() || !found->second.is_valid()) {
         fail(-32005, "TASK_UNAVAILABLE", "task has no active torrent handle", true);
@@ -491,6 +847,7 @@ nlohmann::json Engine::task_overview_locked(const std::string& id) {
         {"totalFiles", 0},
         {"contentFiles", 0},
         {"totalPeers", 0},
+        {"httpConnections", 0},
     };
     if (!info) return overview;
 
@@ -516,7 +873,27 @@ nlohmann::json Engine::task_overview_locked(const std::string& id) {
 }
 
 nlohmann::json Engine::task_files_locked(const std::string& id, std::size_t offset, std::size_t limit) {
-    (void)require_task_locked(id);
+    const auto& task = require_task_locked(id);
+    if (task.source_kind == "http") {
+        nlohmann::json files = nlohmann::json::array();
+        if (offset == 0 && limit > 0) {
+            files.push_back({
+                {"path", http_file_names_.at(id)},
+                {"size", task.total_bytes},
+                {"completedBytes", task.downloaded_bytes},
+                {"priority", 4},
+                {"isPadding", false},
+            });
+        }
+        return {
+            {"files", std::move(files)},
+            {"filesTruncated", false},
+            {"totalFiles", 1},
+            {"contentFiles", 1},
+            {"offset", offset},
+            {"nextOffset", nlohmann::json()},
+        };
+    }
     const auto found = handles_.find(id);
     if (found == handles_.end() || !found->second.is_valid()) {
         fail(-32005, "TASK_UNAVAILABLE", "task has no active torrent handle", true);
@@ -574,7 +951,16 @@ nlohmann::json Engine::task_files_locked(const std::string& id, std::size_t offs
 }
 
 nlohmann::json Engine::task_peers_locked(const std::string& id, std::size_t offset, std::size_t limit) {
-    (void)require_task_locked(id);
+    const auto& task = require_task_locked(id);
+    if (task.source_kind == "http") {
+        return {
+            {"peers", nlohmann::json::array()},
+            {"peersTruncated", false},
+            {"totalPeers", 0},
+            {"offset", offset},
+            {"nextOffset", nlohmann::json()},
+        };
+    }
     const auto found = handles_.find(id);
     if (found == handles_.end() || !found->second.is_valid()) {
         fail(-32005, "TASK_UNAVAILABLE", "task has no active torrent handle", true);
@@ -647,6 +1033,9 @@ nlohmann::json Engine::set_file_priorities(const nlohmann::json& params) {
     const auto found = tasks_.find(id);
     if (found == tasks_.end()) fail(-32004, "TASK_NOT_FOUND", "task not found");
     const auto& task = found->second;
+    if (task.source_kind == "http") {
+        fail(-32005, "TASK_UNAVAILABLE", "HTTP single-file tasks do not support file priorities");
+    }
 
     const auto& patch = params.at("priorities");
     if (!patch.is_object() || patch.empty()) {
@@ -725,6 +1114,20 @@ nlohmann::json Engine::pause_task(const nlohmann::json& params) {
     require_initialized();
     auto& task = require_task_locked(params.at("id").get<std::string>());
     if (task.state != TaskState::completed) {
+        if (task.source_kind == "http") {
+            if (const auto progress = http_downloads_.progress(task.id)) {
+                if (progress->total_bytes > 0) task.total_bytes = progress->total_bytes;
+                task.downloaded_bytes = progress->downloaded_bytes;
+            }
+            http_downloads_.cancel(task.id);
+            task.download_rate = 0;
+            task.state = TaskState::paused;
+            persist_catalog_locked();
+            emit_task("event.taskUpdated", task);
+            apply_shared_download_budget_locked();
+            if (schedule_http_tasks_locked()) persist_catalog_locked();
+            return {{"task", task}};
+        }
         const auto handle = handles_.find(task.id);
         if (handle == handles_.end()) fail(-32005, "TASK_UNAVAILABLE", "task has no active torrent handle", true);
         handle->second.pause();
@@ -742,6 +1145,14 @@ nlohmann::json Engine::resume_task(const nlohmann::json& params) {
     require_initialized();
     auto& task = require_task_locked(params.at("id").get<std::string>());
     if (task.state == TaskState::paused || task.state == TaskState::error) {
+        if (task.source_kind == "http") {
+            task.last_error.reset();
+            task.state = TaskState::queued;
+            persist_catalog_locked();
+            emit_task("event.taskUpdated", task);
+            if (schedule_http_tasks_locked()) persist_catalog_locked();
+            return {{"task", task}};
+        }
         const auto handle = handles_.find(task.id);
         if (handle == handles_.end()) fail(-32005, "TASK_UNAVAILABLE", "task has no active torrent handle", true);
         task.last_error.reset();
@@ -839,6 +1250,10 @@ nlohmann::json Engine::recheck_task(const nlohmann::json& params) {
     std::scoped_lock lock(mutex_);
     require_initialized();
     auto& task = require_task_locked(params.at("id").get<std::string>());
+    if (task.source_kind == "http") {
+        fail(-32005, "TASK_UNAVAILABLE",
+            "HTTP tasks do not have cryptographic metadata for rechecking");
+    }
     const auto handle = handles_.find(task.id);
     if (handle == handles_.end()) fail(-32005, "TASK_UNAVAILABLE", "task has no active torrent handle", true);
     start_recheck_locked(task, handle->second);
@@ -851,11 +1266,41 @@ nlohmann::json Engine::remove_task(const nlohmann::json& params) {
     const auto id = params.at("id").get<std::string>();
     auto& task = require_task_locked(id);
     const bool delete_data = params.value("deleteData", false);
-    const auto handle = handles_.find(id);
-    if (handle != handles_.end()) {
-        session_->remove_torrent(handle->second, delete_data ? lt::session::delete_files : lt::remove_flags_t{});
-    } else if (delete_data) {
-        fail(-32005, "TASK_UNAVAILABLE", "cannot safely delete data without torrent metadata", false);
+    if (task.source_kind == "http") {
+        http_downloads_.cancel(id);
+        if (delete_data) {
+            const auto partial = http_partial_path_locked(id);
+            for (const auto& path : {partial, http_target_path_locked(id)}) {
+                std::error_code error;
+                std::filesystem::remove(path, error);
+                if (error) {
+                    task.state = TaskState::error;
+                    task.download_rate = 0;
+                    task.last_error = TaskError{
+                        "STORAGE_ERROR", "cannot delete HTTP task data: " + error.message(), true};
+                    persist_catalog_locked();
+                    emit_task("event.taskUpdated", task);
+                    apply_shared_download_budget_locked();
+                    fail(-32000, "STORAGE_ERROR",
+                        "cannot delete HTTP task data: " + error.message(), true);
+                }
+            }
+            std::error_code state_error;
+            remove_http_transfer_state(partial, state_error);
+            if (state_error) {
+                fail(-32000, "STORAGE_ERROR",
+                    "cannot delete HTTP range state: " + state_error.message(), true);
+            }
+        }
+    } else {
+        const auto handle = handles_.find(id);
+        if (handle != handles_.end()) {
+            session_->remove_torrent(handle->second,
+                delete_data ? lt::session::delete_files : lt::remove_flags_t{});
+        } else if (delete_data) {
+            fail(-32005, "TASK_UNAVAILABLE",
+                "cannot safely delete data without torrent metadata", false);
+        }
     }
     const auto snapshot = task;
     handles_.erase(id);
@@ -866,11 +1311,14 @@ nlohmann::json Engine::remove_task(const nlohmann::json& params) {
     metadata_started_.erase(id);
     next_payload_probe_.erase(id);
     file_priorities_.erase(id);
+    http_file_names_.erase(id);
     tasks_.erase(id);
     std::error_code resume_error;
     std::filesystem::remove(state_path_ / "resume" / (id + ".fastresume"), resume_error);
     persist_catalog_locked();
     event_sink_("event.taskRemoved", {{"sequence", ++sequence_}, {"task", snapshot}, {"dataDeleted", delete_data}});
+    apply_shared_download_budget_locked();
+    if (schedule_http_tasks_locked()) persist_catalog_locked();
     return {{"removed", true}, {"dataDeleted", delete_data}};
 }
 
@@ -893,6 +1341,16 @@ void Engine::require_initialized() const {
 }
 
 void Engine::finalize_locked() {
+    for (auto& [id, task] : tasks_) {
+        if (task.source_kind != "http") continue;
+        if (const auto progress = http_downloads_.progress(id)) {
+            if (progress->total_bytes > 0) task.total_bytes = progress->total_bytes;
+            task.downloaded_bytes = progress->downloaded_bytes;
+        }
+        http_downloads_.cancel(id);
+        task.download_rate = 0;
+        if (task.state != TaskState::completed) task.state = TaskState::paused;
+    }
     for (auto& [id, handle] : handles_) {
         handle.pause();
         auto& task = tasks_.at(id);
@@ -917,10 +1375,11 @@ void Engine::persist_catalog_locked() {
         (void)id;
         nlohmann::json item = task;
         item["source"] = task.source;
+        if (task.source_kind == "http") item["fileName"] = http_file_names_.at(id);
         task_json.push_back(std::move(item));
     }
     const nlohmann::json catalog = {
-        {"schemaVersion", 2}, {"config", config_json(config_)}, {"tasks", std::move(task_json)}};
+        {"schemaVersion", 3}, {"config", config_json(config_)}, {"tasks", std::move(task_json)}};
     const auto target = state_path_ / "catalog.json";
     const auto temporary = state_path_ / "catalog.json.tmp";
     {
@@ -942,7 +1401,7 @@ bool Engine::load_catalog_locked() {
         std::ifstream input(catalog_path, std::ios::binary);
         const auto catalog = nlohmann::json::parse(input);
         const int schema_version = catalog.value("schemaVersion", 0);
-        if (schema_version != 1 && schema_version != 2) return false;
+        if (schema_version != 1 && schema_version != 2 && schema_version != 3) return false;
         if (catalog.contains("config")) {
             config_ = apply_config_patch(config_, catalog["config"]);
             if (schema_version == 1) {
@@ -951,7 +1410,7 @@ bool Engine::load_catalog_locked() {
                 config_.seed_ratio_limit = 2.0;
                 config_.seed_time_limit_minutes = 60;
             }
-            session_->apply_settings(make_settings(config_, user_agent_));
+            session_->apply_settings(make_settings(config_, proxy_, user_agent_));
             apply_local_rate_limits(*session_, config_);
         }
         for (const auto& item : catalog.value("tasks", nlohmann::json::array())) {
@@ -959,6 +1418,68 @@ bool Engine::load_catalog_locked() {
                 auto task = item.get<TaskSnapshot>();
                 if (schema_version == 1 && task.state == TaskState::completed) {
                     task.seed_stop_reason = SeedStopReason::disabled;
+                }
+                if (task.source_kind == "http") {
+                    if (schema_version < 3 || task.source.empty()) {
+                        throw std::runtime_error("HTTP task catalog fields are missing");
+                    }
+                    const auto normalized = normalize_http_url(task.source);
+                    if (!normalized) throw std::runtime_error("HTTP task URL is invalid");
+                    task.source = *normalized;
+                    const auto file_name = item.at("fileName").get<std::string>();
+                    const auto relative = path_from_utf8(file_name);
+                    if (relative.empty() || relative.is_absolute() || relative.has_root_name()
+                        || relative.has_root_directory() || !relative.parent_path().empty()
+                        || relative == "." || relative == "..") {
+                        throw std::runtime_error("HTTP task filename is unsafe");
+                    }
+
+                    const auto target = task.save_path / relative;
+                    auto partial = target;
+                    partial += path_from_utf8("." + task.id + ".part");
+                    std::error_code error;
+                    const bool target_is_regular = std::filesystem::is_regular_file(target, error);
+                    if (error) throw std::runtime_error(error.message());
+                    if (target_is_regular && task.state == TaskState::completed) {
+                        const auto size = std::filesystem::file_size(target, error);
+                        if (error) throw std::runtime_error(error.message());
+                        task.total_bytes = static_cast<std::uint64_t>(size);
+                        task.downloaded_bytes = task.total_bytes;
+                        task.verified_bytes = task.total_bytes;
+                        task.download_rate = 0;
+                        task.state = TaskState::completed;
+                        task.last_error.reset();
+                    } else if (std::filesystem::exists(target, error)) {
+                        if (error) throw std::runtime_error(error.message());
+                        task.download_rate = 0;
+                        task.state = TaskState::error;
+                        task.last_error = TaskError{
+                            "TARGET_FILE_EXISTS", "HTTP target file already exists", false};
+                    } else {
+                        if (error) throw std::runtime_error(error.message());
+                        error.clear();
+                        if (const auto progress = read_http_transfer_progress(partial)) {
+                            task.total_bytes = progress->total_bytes;
+                            task.downloaded_bytes = progress->downloaded_bytes;
+                        } else if (std::filesystem::is_regular_file(partial, error)) {
+                            const auto size = std::filesystem::file_size(partial, error);
+                            if (!error) {
+                                task.downloaded_bytes = static_cast<std::uint64_t>(size);
+                            }
+                        }
+                        task.verified_bytes = 0;
+                        task.download_rate = 0;
+                        if (task.state == TaskState::completed) {
+                            task.state = TaskState::error;
+                            task.last_error = TaskError{
+                                "DATA_MISSING", "completed HTTP target file is missing", true};
+                        } else if (task.state != TaskState::paused && task.state != TaskState::error) {
+                            task.state = TaskState::queued;
+                        }
+                    }
+                    http_file_names_.emplace(task.id, file_name);
+                    tasks_.emplace(task.id, std::move(task));
+                    continue;
                 }
                 if (task.source.empty()) {
                     tasks_.emplace(task.id, std::move(task));
@@ -1121,6 +1642,7 @@ void Engine::fail_task_locked(const std::string& id, std::string code, std::stri
     const auto handle = handles_.find(id);
     if (handle != handles_.end()) handle->second.pause();
     auto& task = tasks_.at(id);
+    if (task.source_kind == "http") http_downloads_.cancel(id);
     task.state = TaskState::error;
     task.download_rate = 0;
     task.upload_rate = 0;
@@ -1378,7 +1900,10 @@ void Engine::worker_loop(std::stop_token stop_token) {
             if (initialized_ && session_) {
                 process_alerts_locked();
                 request_periodic_resume_saves_locked();
-                if (update_snapshots_locked(true)) persist_catalog_locked();
+                bool catalog_changed = update_snapshots_locked(true);
+                catalog_changed = update_http_tasks_locked(true) || catalog_changed;
+                catalog_changed = schedule_http_tasks_locked() || catalog_changed;
+                if (catalog_changed) persist_catalog_locked();
             }
         } catch (...) {
             // Request handlers surface persistent failures. The monitor must never terminate the process.

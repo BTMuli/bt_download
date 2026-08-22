@@ -17,10 +17,13 @@ cmake --install out/build/windows-x64-release
 
 产物至少包含：
 
-- `bt_download.exe`、`torrent-rasterbar.dll`、`libssl-3-x64.dll` 和 `libcrypto-3-x64.dll`；
+- `bt_download.exe`、`torrent-rasterbar.dll`、`libcurl.dll`、`z.dll`、
+  `libssl-3-x64.dll` 和 `libcrypto-3-x64.dll`；
 - MSVC C++ 运行库 DLL；Windows 10/11 自带的系统 DLL 和 Universal CRT 不重复复制；
 - `THIRD_PARTY_NOTICES.txt` 与 `licenses/` 下的原始许可证文本；
-- `sbom.spdx.json`，记录应用、libtorrent、OpenSSL、nlohmann/json、Boost 和 MSVC 运行库的锁定版本、依赖关系，以及全部随包二进制的 SHA-256。
+- `sbom.spdx.json`，记录应用、libtorrent、curl、zlib、OpenSSL、
+  nlohmann/json、Boost 和 MSVC 运行库的锁定版本、依赖关系，以及全部随包
+  二进制的 SHA-256。
 
 ## 接入约束
 

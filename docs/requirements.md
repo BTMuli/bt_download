@@ -1,17 +1,21 @@
-# BangumiToday 内置 BT 下载引擎需求分析
+# BangumiToday 内置下载引擎需求分析
 
 > 状态：提案（Proposed）  
 > 分析基线：BangumiToday `v0.8.0`（提交 `ac798cf`，2026-08-01）  
 > 首期目标平台：Windows 10/11 x64  
-> 本文中的“BT 下载”指根据 `.torrent` 元数据或 Magnet URI 下载其指向的内容，不是仅把 `.torrent` 文件保存到本地。
+> 本文中的“BT 下载”指根据 `.torrent` 元数据或 Magnet URI 下载其指向的内容，
+> 不是仅把 `.torrent` 文件保存到本地。协议 `1.4` 起还提供独立的普通 HTTP(S)
+> 文件传输后端。
 
 ## 1. 结论
 
 建议将本仓库建设为一个**随 BangumiToday 打包的无界面伴随进程**：
 
-- 下载核心采用 libtorrent，并通过本仓库自有的窄接口隔离其 C++ API；
+- BT 核心采用 libtorrent，HTTP(S) 文件传输采用 libcurl，并通过本仓库自有的
+  窄接口隔离第三方 C++ API；
 - BangumiToday 使用 `Process.start` 启动 `bt_download.exe`，通过标准输入/输出上的 JSON-RPC 调用；
-- 引擎负责 BT 协议、任务生命周期、断点恢复和资源限制；BangumiToday 负责 RSS、目录选择、任务展示和用户交互；
+- 引擎负责 BT/HTTP 传输、任务生命周期、断点恢复和资源限制；BangumiToday
+  负责 RSS、目录选择、任务展示和用户交互；
 - 默认与 BangumiToday 同生命周期，不注册系统服务、不开放远程端口、不要求管理员权限；
 - 首期替代 Motrix 的核心链路，同时移除 BT 任务对 Flutter Widget 生命周期的依赖。
 
@@ -61,6 +65,7 @@ RSS 条目
 
 - 在未安装 Motrix 的干净系统上完成从 RSS 条目到负载文件落盘的全流程；
 - 支持 `.torrent` 文件和 Magnet URI；
+- 支持手动添加普通 HTTP(S) 文件直链；
 - 支持添加、查询、暂停、继续、重试、校验和移除任务；
 - 应用或引擎重启后可恢复未完成任务，不重复下载已校验的数据；
 - 下载引擎崩溃不应带崩 Flutter UI，UI 能识别故障并重启引擎；
@@ -97,6 +102,16 @@ RSS 条目
 2. 引擎先进入 `metadata` 状态，通过 DHT/Tracker/Peer 获取元数据。
 3. 元数据可用后，引擎进行磁盘空间检查并转入排队或下载状态。
 4. 元数据超时必须形成可重试错误，不得让任务永久停留在不透明状态。
+
+### 4.3 从 HTTP(S) 文件直链下载
+
+1. 用户在下载页手动输入 HTTP(S) URL 和保存目录。
+2. 远程 `.torrent` 仍由应用获取元数据后创建 BT 任务；其他 URL 以 `http` 来源
+   直接提交引擎。
+3. 引擎生成安全且不冲突的目标文件名，先写任务专属 `.part` 文件。
+4. 用户暂停、应用退出或网络错误后，继续任务时使用 HTTP Range 恢复；服务器支持时
+   使用受限数量的并发区间连接，不支持 Range 时自动降级为单连接从头下载。
+5. 传输成功后关闭临时文件并在同目录重命名，UI 复用现有完成通知和目录打开能力。
 
 ### 4.3 中断恢复
 
@@ -151,6 +166,7 @@ RSS 条目
 | FR-019 | P0 | Tracker 补充与更新 | BangumiToday 可从用户选择的文本列表源每日更新并合并手工 Tracker，引擎负责二次校验、去重和应用；同步失败保留最后成功快照，私有种子禁止注入公共 Tracker。 |
 | FR-020 | P1 | URL 直传 | 引擎可选支持直接接收 HTTP/HTTPS `.torrent` URL；P0 阶段仍可复用 BangumiToday 当前的 Dio 下载与镜像改写。 |
 | FR-021 | P0 | 限量做种策略 | 新安装默认做种至分享率 `2.0` 或 `60` 分钟任一先到即停；状态、累计上传、累计做种时间和停止原因可查询并跨重启恢复。 |
+| FR-023 | P0 | HTTP 文件任务 | 接受普通 HTTP(S) 文件 URL，支持重定向、进度、限速、暂停、并发 Range 分片、重试、分段持久恢复、不支持 Range 时安全降级和精确删除；不得把文件直链交给 libtorrent 元数据解析。 |
 | FR-022 | P2 | 跨平台 | 在不改变上层调用契约的前提下增加 macOS/Linux 构建。 |
 
 ## 6. 非功能需求
@@ -180,7 +196,8 @@ RSS 条目
 
 - 首期只允许父进程通过继承的 stdio 管道调用，不监听 TCP/UDP 管理端口；BT 协议本身所需监听端口除外；
 - 引擎以当前用户权限运行，不提权、不注册 Windows 服务、不写安装目录；
-- 将 `.torrent`、Magnet、Tracker、Peer 消息和文件名视为不可信输入，限制长度、集合数量和嵌套深度；
+- 将 `.torrent`、Magnet、HTTP URL/响应、Tracker、Peer 消息和文件名视为不可信
+  输入，限制长度、集合数量和嵌套深度；
 - 对目标目录和种子内部路径做规范化校验，删除操作还要验证最终路径仍位于该任务根目录；
 - 日志不得记录完整 Magnet URI、带查询参数的 RSS/Tracker URL、私有 Tracker passkey 或用户目录之外的敏感信息；
 - UI 首次启用时应说明 BT 会向其他 Peer 暴露用户 IP，并产生上传流量；
@@ -212,9 +229,9 @@ RSS 条目
 └─────────────────────┼──────────────────────────────────────────┘
                       │ child process, same user
 ┌─────────────────────▼ bt_download.exe ─────────────────────────┐
-│ Protocol adapter -> Task service -> libtorrent facade/session  │
+│ Protocol adapter -> Task service -> libtorrent / libcurl       │
 │                         │                    │                  │
-│                  task catalog/resume       payload files       │
+│              catalog/fast-resume/.part     payload files       │
 │                    (LocalAppData)      (user-selected folder)  │
 └────────────────────────────────────────────────────────────────┘
 ```
@@ -263,7 +280,7 @@ RSS 条目
 | `engine.status` | 健康检查和版本/统计查询 |
 | `engine.configure` | 更新限速、并发、连接限制、补充 Tracker 和做种策略 |
 | `engine.shutdown` | 保存状态并优雅退出 |
-| `task.add` | 从 `.torrent` 路径或 Magnet 创建任务 |
+| `task.add` | 从 `.torrent` 路径、Magnet 或 HTTP(S) 文件 URL 创建任务 |
 | `task.list` / `task.get` | 获取全量或单任务快照 |
 | `task.pause` / `task.resume` | 暂停或继续任务 |
 | `task.retry` / `task.recheck` | 重试错误或强制校验 |
@@ -366,6 +383,8 @@ M0 任一关键项失败，应先修正架构或打包方案，而不是直接�
 
 - [ ] 测试机器未安装 Motrix，也未关联 `.torrent`，仍可完成下载。
 - [ ] `.torrent` 与 Magnet 两类任务均可下载并通过 piece hash 校验。
+- [ ] HTTP(S) 文件任务可多连接分片下载、暂停后按区间继续；不支持 Range 时可降级，
+  两条路径的最终文件均与服务端字节一致。
 - [ ] 切换页面、关闭下载管理页不会改变任务状态。
 - [ ] 暂停后重启应用，任务保持暂停；下载中重启，任务能从已校验进度恢复。
 - [ ] 引擎被强制结束时 BangumiToday 不退出，并能提示、重启、恢复任务。

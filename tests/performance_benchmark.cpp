@@ -626,7 +626,7 @@ nlohmann::json run_benchmark(const BenchmarkOptions& options) {
     TemporaryDirectory temporary;
     EngineProcess engine(options.engine_path);
     const auto initialized = engine.request("engine.initialize", {
-        {"protocolVersion", "1.2"},
+        {"protocolVersion", "1.4"},
         {"statePath", path_utf8(temporary.path() / "state")},
         {"config", {
             {"activeDownloads", task_count},

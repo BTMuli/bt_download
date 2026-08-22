@@ -6,9 +6,11 @@ void run_error_mapping_tests();
 void run_config_tests();
 void run_magnet_metadata_tests();
 void run_protocol_tests();
+void run_proxy_config_tests();
 void run_resume_data_tests();
 void run_task_tests();
 void run_file_priority_tests();
+void run_http_download_tests();
 void run_tabbed_details_tests();
 void run_user_agent_tests();
 
@@ -19,9 +21,11 @@ int main() {
         run_config_tests();
         run_magnet_metadata_tests();
         run_protocol_tests();
+        run_proxy_config_tests();
         run_resume_data_tests();
         run_task_tests();
         run_file_priority_tests();
+        run_http_download_tests();
         run_tabbed_details_tests();
         run_user_agent_tests();
         std::cout << "All tests passed\n";

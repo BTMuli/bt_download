@@ -91,7 +91,7 @@ void run_resume_data_tests() {
     {
         bt::Engine engine([](const std::string&, const nlohmann::json&) {});
         const auto initialized = engine.dispatch("engine.initialize", {
-            {"protocolVersion", "1.2"}, {"statePath", path_utf8(legacy_state_path)}});
+            {"protocolVersion", "1.4"}, {"statePath", path_utf8(legacy_state_path)}});
         expect(initialized.at("config").at("seedingEnabled") == false,
             "schema 1 migration silently enabled seeding");
         expect(initialized.at("config").at("additionalTrackers").empty(),
@@ -101,14 +101,14 @@ void run_resume_data_tests() {
     {
         std::ifstream migrated_catalog(legacy_state_path / "catalog.json", std::ios::binary);
         const auto migrated = nlohmann::json::parse(migrated_catalog);
-        expect(migrated.at("schemaVersion") == 2, "schema 1 catalog was not migrated to schema 2");
+        expect(migrated.at("schemaVersion") == 3, "schema 1 catalog was not migrated to schema 3");
     }
 
     const auto seeding_state_path = temporary.path() / "seeding-state";
     {
         bt::Engine engine([](const std::string&, const nlohmann::json&) {});
         engine.dispatch("engine.initialize", {
-            {"protocolVersion", "1.2"}, {"statePath", path_utf8(seeding_state_path)},
+            {"protocolVersion", "1.4"}, {"statePath", path_utf8(seeding_state_path)},
             {"config", {{"seedingEnabled", true}, {"seedRatioLimit", 2.0},
                 {"seedTimeLimitMinutes", 60}}}});
         engine.dispatch("engine.shutdown", nlohmann::json::object());
@@ -135,7 +135,7 @@ void run_resume_data_tests() {
     {
         bt::Engine engine([](const std::string&, const nlohmann::json&) {});
         engine.dispatch("engine.initialize", {
-            {"protocolVersion", "1.2"}, {"statePath", path_utf8(state_path)}});
+            {"protocolVersion", "1.4"}, {"statePath", path_utf8(state_path)}});
         const auto added = engine.dispatch("task.add", {
             {"source", {{"kind", "torrentFile"}, {"path", path_utf8(torrent_path)}}},
             {"savePath", path_utf8(save_path)}, {"start", false}});
@@ -166,7 +166,7 @@ void run_resume_data_tests() {
     {
         bt::Engine engine([](const std::string&, const nlohmann::json&) {});
         const auto initialized = engine.dispatch("engine.initialize", {
-            {"protocolVersion", "1.2"}, {"statePath", path_utf8(state_path)}});
+            {"protocolVersion", "1.4"}, {"statePath", path_utf8(state_path)}});
         expect(initialized.at("restoredTasks") == 1, "resume task was not restored");
         const auto task = engine.dispatch("task.get", {{"id", task_id}}).at("task");
         expect(task.at("state") == "paused", "restored task did not preserve paused state");
@@ -180,7 +180,7 @@ void run_resume_data_tests() {
     {
         bt::Engine engine([](const std::string&, const nlohmann::json&) {});
         const auto initialized = engine.dispatch("engine.initialize", {
-            {"protocolVersion", "1.2"}, {"statePath", path_utf8(state_path)}});
+            {"protocolVersion", "1.4"}, {"statePath", path_utf8(state_path)}});
         expect(initialized.at("restoredTasks") == 1, "damaged resume data prevented source fallback");
         engine.dispatch("engine.shutdown", nlohmann::json::object());
     }

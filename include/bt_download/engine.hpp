@@ -1,6 +1,8 @@
 #pragma once
 
 #include "bt_download/config.hpp"
+#include "bt_download/http_download.hpp"
+#include "bt_download/proxy_config.hpp"
 #include "bt_download/task.hpp"
 
 #include <chrono>
@@ -36,6 +38,7 @@ private:
     nlohmann::json initialize(const nlohmann::json& params);
     nlohmann::json status() const;
     nlohmann::json configure(const nlohmann::json& params);
+    nlohmann::json configure_proxy(const nlohmann::json& params);
     nlohmann::json add_task(const nlohmann::json& params);
     nlohmann::json list_tasks();
     nlohmann::json get_task(const nlohmann::json& params);
@@ -66,7 +69,14 @@ private:
         const std::shared_ptr<const libtorrent::torrent_info>& info);
     void apply_additional_trackers_locked(const libtorrent::torrent_handle& handle, bool reannounce);
     void apply_additional_trackers_to_all_locked(bool reannounce);
+    void apply_shared_download_budget_locked();
     bool effective_seeding_enabled() const noexcept;
+    bool schedule_http_tasks_locked();
+    bool update_http_tasks_locked(bool emit_events);
+    std::filesystem::path http_target_path_locked(const std::string& id) const;
+    std::filesystem::path http_partial_path_locked(const std::string& id) const;
+    std::string reserve_http_file_name_locked(const std::filesystem::path& save_path,
+        const std::string& suggested) const;
     void fail_task_locked(const std::string& id, std::string code, std::string message, bool retryable);
     bool load_resume_data_locked(const TaskSnapshot& task, libtorrent::add_torrent_params& add);
     void write_resume_data_locked(const std::string& id, const libtorrent::add_torrent_params& add);
@@ -81,7 +91,9 @@ private:
     EventSink event_sink_;
     mutable std::mutex mutex_;
     std::unique_ptr<libtorrent::session> session_;
+    HttpDownloadManager http_downloads_;
     std::unordered_map<std::string, TaskSnapshot> tasks_;
+    std::unordered_map<std::string, std::string> http_file_names_;
     std::unordered_map<std::string, libtorrent::torrent_handle> handles_;
     std::unordered_map<std::string, std::vector<libtorrent::download_priority_t>> file_priorities_;
     std::unordered_set<std::string> pending_resume_saves_;
@@ -92,6 +104,7 @@ private:
     std::unordered_map<std::string, std::chrono::steady_clock::time_point> next_payload_probe_;
     std::filesystem::path state_path_;
     EngineConfig config_;
+    EngineProxyConfig proxy_;
     std::string user_agent_;
     std::chrono::steady_clock::time_point started_at_;
     std::chrono::steady_clock::time_point next_resume_save_;

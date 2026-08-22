@@ -1,7 +1,7 @@
 # Tracker 与限量做种需求
 
 > 状态：已实现（待发布环境验证）
-> 目标协议：`1.2`（引擎与 BangumiToday 主应用均已严格同步）
+> 目标协议：`1.4`（引擎与 BangumiToday 主应用均已严格同步）
 > 适用范围：BangumiToday 设置页、`BtEngineClient` 与 `bt_download` 伴随进程
 
 ## 1. 结论
@@ -44,7 +44,7 @@ BangumiToday 参考其交互，但不照搬以下实现细节：
 | --- | --- |
 | BangumiToday 设置页 | 编辑列表源、手工 Tracker、自动更新开关和做种策略；展示更新时间、错误和生效数量 |
 | BangumiToday 同步服务 | 获取远程文本、限制响应、解析/校验/去重、维护最后成功快照，并调用 `engine.configure` |
-| `BtEngineClient` | 协议 `1.2` 严格匹配、配置下发、错误映射和任务快照兼容 |
+| `BtEngineClient` | 协议 `1.4` 严格匹配、配置下发、错误映射和任务快照兼容 |
 | `bt_download` | 二次校验 Tracker、按公开/私有属性应用、跟踪做种指标、执行停止条件并持久化状态 |
 | libtorrent | Tracker announce、Peer 连接、上传、累计计数与 fast-resume 基础能力 |
 
@@ -104,7 +104,7 @@ UI 可沿用截图中的“多选来源 + 刷新按钮 + Tracker 文本区 + 自
 
 ### 5.1 配置与默认值
 
-协议 `1.2` 包含以下三个全局字段：
+协议 `1.4` 包含以下三个全局字段：
 
 | 字段 | 范围 | 新安装默认值 | 语义 |
 | --- | --- | --- | --- |
@@ -161,7 +161,7 @@ downloading -> seeding -> completed
 
 ## 6. 协议与持久化
 
-`engine.initialize` 和 `engine.configure` 在协议 `1.2` 接受以下字段：
+`engine.initialize` 和 `engine.configure` 在协议 `1.4` 接受以下字段：
 
 ```json
 {
@@ -181,7 +181,7 @@ downloading -> seeding -> completed
 - `additionalTrackers` 仍由引擎执行同等的 URL、长度、数量和去重校验，不能信任应用侧结果；
 - `engine.status` 返回最终生效配置，但不得把含查询参数的 Tracker URL 写入普通诊断日志；
 - catalog schema 升级时保存做种配置；每个任务的 fast-resume 保存累计上传量和做种时间；
-- 引擎与客户端严格使用协议 `1.2`，不提供旧协议协商或回退；字段缺省时仍按安全默认值处理。
+- 引擎与客户端严格使用协议 `1.4`，不提供旧协议协商或回退；字段缺省时仍按安全默认值处理。
 
 远程列表源、更新时间和同步错误属于 BangumiToday 配置，不进入引擎 catalog。
 

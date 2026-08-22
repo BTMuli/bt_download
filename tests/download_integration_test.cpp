@@ -259,6 +259,198 @@ private:
     std::jthread worker_;
 };
 
+class LocalHttpFileServer {
+public:
+    explicit LocalHttpFileServer(std::vector<char> payload)
+        : payload_(std::move(payload)) {
+        socket_ = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (socket_ == INVALID_SOCKET) throw std::runtime_error("cannot create HTTP file socket");
+
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        address.sin_port = 0;
+        if (::bind(socket_, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) == SOCKET_ERROR
+            || ::listen(socket_, SOMAXCONN) == SOCKET_ERROR) {
+            closesocket(socket_);
+            throw std::runtime_error("cannot bind HTTP file server");
+        }
+        int length = sizeof(address);
+        if (::getsockname(socket_, reinterpret_cast<sockaddr*>(&address), &length) == SOCKET_ERROR) {
+            closesocket(socket_);
+            throw std::runtime_error("cannot query HTTP file server port");
+        }
+        port_ = ntohs(address.sin_port);
+        worker_ = std::jthread([this](std::stop_token stop_token) { serve(stop_token); });
+    }
+
+    ~LocalHttpFileServer() {
+        worker_.request_stop();
+        ::shutdown(socket_, SD_BOTH);
+        closesocket(socket_);
+        if (worker_.joinable()) worker_.join();
+        for (auto& client : clients_) client.request_stop();
+        clients_.clear();
+    }
+
+    std::string url() const {
+        return "http://127.0.0.1:" + std::to_string(port_) + "/payload.bin";
+    }
+
+    std::string redirect_url() const {
+        return "http://127.0.0.1:" + std::to_string(port_) + "/redirect.bin";
+    }
+
+    std::string broken_redirect_url() const {
+        return "http://127.0.0.1:" + std::to_string(port_) + "/broken-redirect.bin";
+    }
+
+    std::string no_range_url() const {
+        return "http://127.0.0.1:" + std::to_string(port_) + "/no-range.bin";
+    }
+
+    std::uint32_t range_requests() const { return range_requests_.load(); }
+    std::uint32_t max_concurrent_requests() const {
+        return max_concurrent_requests_.load();
+    }
+
+private:
+    void serve(std::stop_token stop_token) {
+        while (!stop_token.stop_requested()) {
+            const SOCKET client = ::accept(socket_, nullptr, nullptr);
+            if (client == INVALID_SOCKET) break;
+            clients_.emplace_back([this, client](std::stop_token client_stop) {
+                serve_client(client, client_stop);
+            });
+        }
+    }
+
+    void serve_client(SOCKET client, std::stop_token stop_token) {
+        struct ActiveGuard {
+            explicit ActiveGuard(std::atomic<std::uint32_t>& value) : value_(value) {
+                ++value_;
+            }
+            ~ActiveGuard() { --value_; }
+            std::atomic<std::uint32_t>& value_;
+        } guard(active_requests_);
+        auto observed = active_requests_.load();
+        auto maximum = max_concurrent_requests_.load();
+        while (observed > maximum
+            && !max_concurrent_requests_.compare_exchange_weak(maximum, observed)) {}
+
+        std::string request;
+        std::array<char, 2048> buffer{};
+        while (request.find("\r\n\r\n") == std::string::npos && request.size() < 16384) {
+            const int received = ::recv(client, buffer.data(), static_cast<int>(buffer.size()), 0);
+            if (received <= 0) break;
+            request.append(buffer.data(), static_cast<std::size_t>(received));
+        }
+
+        if (request.starts_with("GET /redirect.bin ")) {
+            const std::string body = "redirect response body must not reach the output file";
+            const std::string response = "HTTP/1.1 302 Found\r\nLocation: /payload.bin\r\n"
+                "Content-Type: text/plain\r\nContent-Length: " + std::to_string(body.size())
+                + "\r\nConnection: close\r\n\r\n" + body;
+            send_all(client, response);
+            ::shutdown(client, SD_BOTH);
+            closesocket(client);
+            return;
+        }
+        if (request.starts_with("GET /broken-redirect.bin ")) {
+            const std::string body = "redirect without a location";
+            const std::string response = "HTTP/1.1 302 Found\r\nContent-Type: text/plain\r\n"
+                "Content-Length: " + std::to_string(body.size())
+                + "\r\nConnection: close\r\n\r\n" + body;
+            send_all(client, response);
+            ::shutdown(client, SD_BOTH);
+            closesocket(client);
+            return;
+        }
+
+        const auto requested = requested_range(request);
+        if (requested) ++range_requests_;
+        const bool supports_range = !request.starts_with("GET /no-range.bin ");
+        const auto start = requested && supports_range ? requested->first : 0;
+        const auto end = requested && supports_range
+            ? std::min(requested->second, payload_.size() - 1)
+            : payload_.size() - 1;
+        if (start >= payload_.size()) {
+            send_all(client, "HTTP/1.1 416 Range Not Satisfiable\r\nConnection: close\r\n\r\n");
+        } else {
+            std::string headers = requested && supports_range
+                ? "HTTP/1.1 206 Partial Content\r\n" : "HTTP/1.1 200 OK\r\n";
+            headers += "Content-Type: application/octet-stream\r\n"
+                "Accept-Ranges: bytes\r\nETag: \"integration-payload-v1\"\r\n"
+                "Last-Modified: Sat, 22 Aug 2026 00:00:00 GMT\r\n";
+            if (requested && supports_range) {
+                headers += "Content-Range: bytes " + std::to_string(start) + "-"
+                    + std::to_string(end) + "/" + std::to_string(payload_.size()) + "\r\n";
+            }
+            headers += "Content-Length: " + std::to_string(end - start + 1)
+                + "\r\nConnection: close\r\n\r\n";
+            if (send_all(client, headers)) {
+                send_payload(client, start, end + 1, stop_token);
+            }
+        }
+        ::shutdown(client, SD_BOTH);
+        closesocket(client);
+    }
+
+    static std::optional<std::pair<std::size_t, std::size_t>> requested_range(
+        const std::string& request) {
+        constexpr std::string_view marker = "\r\nRange: bytes=";
+        const auto position = request.find(marker);
+        if (position == std::string::npos) return std::nullopt;
+        const auto begin = request.data() + position + marker.size();
+        const auto dash = request.find('-', position + marker.size());
+        if (dash == std::string::npos) return std::nullopt;
+        const auto line_end = request.find("\r\n", dash);
+        if (line_end == std::string::npos) return std::nullopt;
+        std::size_t start = 0;
+        std::size_t end = (std::numeric_limits<std::size_t>::max)();
+        const auto parsed_start = std::from_chars(begin, request.data() + dash, start);
+        if (parsed_start.ec != std::errc{}) return std::nullopt;
+        if (line_end > dash + 1) {
+            const auto parsed_end = std::from_chars(
+                request.data() + dash + 1, request.data() + line_end, end);
+            if (parsed_end.ec != std::errc{}) return std::nullopt;
+        }
+        return std::pair{start, end};
+    }
+
+    static bool send_all(SOCKET socket, const std::string& value) {
+        std::size_t offset = 0;
+        while (offset < value.size()) {
+            const int sent = ::send(socket, value.data() + offset,
+                static_cast<int>(value.size() - offset), 0);
+            if (sent <= 0) return false;
+            offset += static_cast<std::size_t>(sent);
+        }
+        return true;
+    }
+
+    void send_payload(SOCKET client, std::size_t offset, std::size_t end,
+        std::stop_token stop_token) const {
+        constexpr std::size_t chunk_size = 16 * 1024;
+        while (offset < end && !stop_token.stop_requested()) {
+            const auto count = std::min(chunk_size, end - offset);
+            const int sent = ::send(client, payload_.data() + offset, static_cast<int>(count), 0);
+            if (sent <= 0) return;
+            offset += static_cast<std::size_t>(sent);
+            std::this_thread::sleep_for(2ms);
+        }
+    }
+
+    SOCKET socket_{INVALID_SOCKET};
+    std::uint16_t port_{0};
+    std::vector<char> payload_;
+    std::atomic<std::uint32_t> range_requests_{0};
+    std::atomic<std::uint32_t> active_requests_{0};
+    std::atomic<std::uint32_t> max_concurrent_requests_{0};
+    std::jthread worker_;
+    std::vector<std::jthread> clients_;
+};
+
 void write_payload(const std::filesystem::path& path, std::size_t size, std::uint8_t seed) {
     std::filesystem::create_directories(path.parent_path());
     std::vector<char> bytes(size);
@@ -510,7 +702,7 @@ int run_recovery_child(const std::filesystem::path& torrent_path,
     const std::filesystem::path& checkpoint_path) {
     bt::Engine engine([](const std::string&, const nlohmann::json&) {});
     engine.dispatch("engine.initialize", {
-        {"protocolVersion", "1.2"},
+        {"protocolVersion", "1.4"},
         {"statePath", path_utf8(state_path)},
         {"config", {{"activeDownloads", 1}, {"downloadRateLimit", 512 * 1024}}},
     });
@@ -551,6 +743,219 @@ int run_recovery_child(const std::filesystem::path& torrent_path,
         expect(static_cast<bool>(output), "recovery child cannot publish its checkpoint");
     }
     while (true) std::this_thread::sleep_for(1s);
+}
+
+void run_http_download_integration_test() {
+    WinsockRuntime winsock;
+    TemporaryDirectory temporary;
+    std::vector<char> payload(2 * 1024 * 1024 + 137);
+    for (std::size_t index = 0; index < payload.size(); ++index) {
+        payload[index] = static_cast<char>((index * 29U + 17U) & 0xffU);
+    }
+    LocalHttpFileServer server(payload);
+    const auto state_path = temporary.path() / "http-state";
+    const auto save_path = temporary.path() / "http-download";
+    std::filesystem::create_directories(save_path);
+
+    bt::Engine engine([](const std::string&, const nlohmann::json&) {});
+    engine.dispatch("engine.initialize", {
+        {"protocolVersion", "1.4"},
+        {"statePath", path_utf8(state_path)},
+        {"config", {{"activeDownloads", 1}, {"downloadRateLimit", 512 * 1024}}},
+    });
+    expect(engine.dispatch("engine.status", nlohmann::json::object())
+            .at("features").dump().find("httpMultiConnection") != std::string::npos,
+        "engine.status did not advertise HTTP multi-connection support");
+    const auto added = engine.dispatch("task.add", {
+        {"source", {{"kind", "http"}, {"url", server.url()}}},
+        {"savePath", path_utf8(save_path)},
+        {"start", true},
+    });
+    const auto id = added.at("task").at("id").get<std::string>();
+    expect(added.at("task").at("sourceKind") == "http", "HTTP task source kind was not retained");
+    expect(added.at("task").at("infoHash").is_null(), "HTTP task unexpectedly exposed an info-hash");
+
+    nlohmann::json partial;
+    nlohmann::json partial_details;
+    const auto partial_deadline = std::chrono::steady_clock::now() + 10s;
+    while (std::chrono::steady_clock::now() < partial_deadline) {
+        partial = engine.dispatch("task.get", {{"id", id}}).at("task");
+        if (partial.at("state") == "error") {
+            throw std::runtime_error("HTTP download entered error state: " + partial.at("lastError").dump());
+        }
+        const auto downloaded = partial.at("downloadedBytes").get<std::uint64_t>();
+        const auto total = partial.at("totalBytes").get<std::uint64_t>();
+        if (downloaded > 0 && total > downloaded) {
+            partial_details = engine.dispatch("task.details", {{"id", id}});
+            const auto pieces = partial_details.at("completedPieces").get<std::string>();
+            if (pieces.find('1') != std::string::npos
+                && pieces.find('0') != std::string::npos
+                && partial_details.at("httpConnections").get<std::size_t>() > 1) {
+                break;
+            }
+        }
+        std::this_thread::sleep_for(50ms);
+    }
+    expect(partial.at("downloadedBytes").get<std::uint64_t>() > 0,
+        "HTTP task did not report partial progress");
+    const auto proxy_update = engine.dispatch("engine.configureProxy", {
+        {"enabled", true},
+        {"httpProxy", "http://127.0.0.1:1"},
+        {"httpsProxy", "http://127.0.0.1:1"},
+        {"bypass", nlohmann::json::array({"127.0.0.1"})},
+        {"peerProxy", {{"host", "127.0.0.1"}, {"port", 1}}},
+    });
+    expect(proxy_update.at("proxy").at("enabled") == true,
+        "runtime proxy update was not applied");
+    expect(engine.dispatch("engine.status", nlohmann::json::object())
+            .at("proxy").at("peerConfigured") == true,
+        "engine status did not report the configured peer proxy");
+    const auto paused = engine.dispatch("task.pause", {{"id", id}}).at("task");
+    expect(paused.at("state") == "paused", "HTTP task did not pause");
+    expect(paused.at("downloadRate") == 0, "paused HTTP task retained a download rate");
+
+    const auto details = engine.dispatch("task.details", {{"id", id}});
+    expect(details.at("totalFiles") == 1 && details.at("totalPeers") == 0,
+        "HTTP task overview did not expose single-file semantics");
+    const auto piece_count = details.at("pieceCount").get<std::uint64_t>();
+    const auto completed_pieces = details.at("completedPieces").get<std::string>();
+    expect(details.at("pieceLength").get<std::uint64_t>() >= 256 * 1024
+            && piece_count > 1 && piece_count <= 256
+            && completed_pieces.size() == piece_count,
+        "HTTP task overview did not expose bounded byte-range pieces");
+    expect(completed_pieces.find('1') != std::string::npos
+            && completed_pieces.find('0') != std::string::npos,
+        "partial HTTP task did not expose both completed and pending byte ranges");
+    expect(server.max_concurrent_requests() > 1,
+        "HTTP task did not issue concurrent range requests");
+    const auto partial_path = save_path
+        / ("payload.bin." + id + ".part");
+    const auto persisted_progress = bt::read_http_transfer_progress(partial_path);
+    expect(persisted_progress && persisted_progress->ranges.size() > 1
+            && persisted_progress->downloaded_bytes > 0
+            && persisted_progress->downloaded_bytes < persisted_progress->total_bytes,
+        "paused HTTP task did not persist its range progress");
+    const auto files = engine.dispatch("task.files", {{"id", id}});
+    expect(files.at("files").size() == 1
+            && files.at("files").at(0).at("path") == "payload.bin",
+        "HTTP task file details are incorrect");
+    const auto peers = engine.dispatch("task.peers", {{"id", id}});
+    expect(peers.at("peers").empty(), "HTTP task unexpectedly exposed peers");
+
+    engine.dispatch("task.resume", {{"id", id}});
+    nlohmann::json completed;
+    const auto completion_deadline = std::chrono::steady_clock::now() + 15s;
+    while (std::chrono::steady_clock::now() < completion_deadline) {
+        completed = engine.dispatch("task.get", {{"id", id}}).at("task");
+        if (completed.at("state") == "completed") break;
+        if (completed.at("state") == "error") {
+            throw std::runtime_error("resumed HTTP download failed: " + completed.at("lastError").dump());
+        }
+        std::this_thread::sleep_for(50ms);
+    }
+    expect(completed.at("state") == "completed", "HTTP task did not complete");
+    expect(completed.at("downloadedBytes") == completed.at("totalBytes"),
+        "HTTP task did not report complete byte counts");
+    const auto completed_details = engine.dispatch("task.details", {{"id", id}});
+    const auto final_pieces = completed_details.at("completedPieces").get<std::string>();
+    expect(!final_pieces.empty()
+            && final_pieces.find_first_not_of('1') == std::string::npos,
+        "completed HTTP task retained incomplete byte ranges");
+    expect(read_bytes(save_path / "payload.bin") == payload,
+        "HTTP payload differs from the server response");
+    expect(server.range_requests() > 0, "resumed HTTP task did not issue a Range request");
+
+    const auto fallback_path = temporary.path() / "http-no-range";
+    std::filesystem::create_directories(fallback_path);
+    const auto fallback_id = engine.dispatch("task.add", {
+        {"source", {{"kind", "http"}, {"url", server.no_range_url()}}},
+        {"savePath", path_utf8(fallback_path)},
+    }).at("task").at("id").get<std::string>();
+    nlohmann::json fallback_completed;
+    const auto fallback_deadline = std::chrono::steady_clock::now() + 15s;
+    while (std::chrono::steady_clock::now() < fallback_deadline) {
+        fallback_completed = engine.dispatch(
+            "task.get", {{"id", fallback_id}}).at("task");
+        if (fallback_completed.at("state") == "completed") break;
+        if (fallback_completed.at("state") == "error") {
+            throw std::runtime_error("HTTP no-range fallback failed: "
+                + fallback_completed.at("lastError").dump());
+        }
+        std::this_thread::sleep_for(50ms);
+    }
+    expect(fallback_completed.at("state") == "completed",
+        "HTTP task did not fall back when Range was unsupported");
+    expect(read_bytes(fallback_path / "no-range.bin") == payload,
+        "HTTP no-range fallback payload differs from the server response");
+    auto fallback_state = fallback_path
+        / ("no-range.bin." + fallback_id + ".part.ranges.json");
+    expect(!std::filesystem::exists(fallback_state),
+        "HTTP no-range fallback retained segmented state after completion");
+    engine.dispatch("task.remove", {{"id", fallback_id}, {"deleteData", true}});
+
+    bool duplicate_rejected = false;
+    try {
+        engine.dispatch("task.add", {
+            {"source", {{"kind", "http"}, {"url", server.url()}}},
+            {"savePath", path_utf8(save_path)},
+        });
+    } catch (const std::exception& exception) {
+        duplicate_rejected = std::string(exception.what()).find("already exists") != std::string::npos;
+    }
+    expect(duplicate_rejected, "duplicate HTTP URL was accepted at the same save path");
+
+    const auto redirect_path = temporary.path() / "http-redirect";
+    std::filesystem::create_directories(redirect_path);
+    const auto redirect_task = engine.dispatch("task.add", {
+        {"source", {{"kind", "http"}, {"url", server.redirect_url()}}},
+        {"savePath", path_utf8(redirect_path)},
+    }).at("task");
+    const auto redirect_id = redirect_task.at("id").get<std::string>();
+    nlohmann::json redirect_completed;
+    const auto redirect_deadline = std::chrono::steady_clock::now() + 15s;
+    while (std::chrono::steady_clock::now() < redirect_deadline) {
+        redirect_completed = engine.dispatch("task.get", {{"id", redirect_id}}).at("task");
+        if (redirect_completed.at("state") == "completed") break;
+        if (redirect_completed.at("state") == "error") {
+            throw std::runtime_error(
+                "redirected HTTP download failed: " + redirect_completed.at("lastError").dump());
+        }
+        std::this_thread::sleep_for(50ms);
+    }
+    expect(redirect_completed.at("state") == "completed",
+        "redirected HTTP task did not complete");
+    expect(read_bytes(redirect_path / "redirect.bin") == payload,
+        "HTTP redirect response body polluted the downloaded payload");
+    engine.dispatch("task.remove", {{"id", redirect_id}, {"deleteData", true}});
+
+    const auto broken_redirect = engine.dispatch("task.add", {
+        {"source", {{"kind", "http"}, {"url", server.broken_redirect_url()}}},
+        {"savePath", path_utf8(redirect_path)},
+    }).at("task");
+    const auto broken_redirect_id = broken_redirect.at("id").get<std::string>();
+    nlohmann::json broken_redirect_failed;
+    const auto broken_redirect_deadline = std::chrono::steady_clock::now() + 5s;
+    while (std::chrono::steady_clock::now() < broken_redirect_deadline) {
+        broken_redirect_failed = engine.dispatch(
+            "task.get", {{"id", broken_redirect_id}}).at("task");
+        if (broken_redirect_failed.at("state") == "error") break;
+        std::this_thread::sleep_for(50ms);
+    }
+    expect(broken_redirect_failed.at("state") == "error"
+            && broken_redirect_failed.at("lastError").at("code") == "HTTP_REDIRECT_ERROR",
+        "HTTP redirect without Location was not rejected");
+    engine.dispatch("task.remove", {{"id", broken_redirect_id}, {"deleteData", true}});
+    engine.dispatch("engine.shutdown", nlohmann::json::object());
+
+    bt::Engine restored([](const std::string&, const nlohmann::json&) {});
+    restored.dispatch("engine.initialize", {
+        {"protocolVersion", "1.4"}, {"statePath", path_utf8(state_path)}});
+    const auto recovered = restored.dispatch("task.get", {{"id", id}}).at("task");
+    expect(recovered.at("state") == "completed", "completed HTTP task was not restored");
+    restored.dispatch("task.remove", {{"id", id}, {"deleteData", true}});
+    expect(!std::filesystem::exists(save_path / "payload.bin"),
+        "HTTP deleteData did not remove the target file");
+    restored.dispatch("engine.shutdown", nlohmann::json::object());
 }
 
 void run_download_integration_test() {
@@ -609,7 +1014,7 @@ void run_download_integration_test() {
     wait_for_seeds({single_seed, bundle_seed, magnet_seed, private_seed, recovery_seed, select_seed});
     bt::Engine engine([](const std::string&, const nlohmann::json&) {});
     engine.dispatch("engine.initialize", {
-        {"protocolVersion", "1.2"},
+        {"protocolVersion", "1.4"},
         {"statePath", path_utf8(temporary.path() / "state")},
         {"config", {{"activeDownloads", 3}, {"metadataTimeoutSeconds", 15}}},
     });
@@ -739,7 +1144,7 @@ void run_download_integration_test() {
 
     bt::Engine restored([](const std::string&, const nlohmann::json&) {});
     const auto initialized = restored.dispatch("engine.initialize", {
-        {"protocolVersion", "1.2"}, {"statePath", path_utf8(recovery_state)}});
+        {"protocolVersion", "1.4"}, {"statePath", path_utf8(recovery_state)}});
     expect(initialized.at("restoredTasks") == 1, "forced termination task was not restored");
     restored.dispatch("engine.configure", {{"downloadRateLimit", 1024}});
     wait_for_recovered_checkpoint(restored, recovery_id, checkpoint_bytes);
@@ -804,7 +1209,7 @@ void run_tracker_and_seeding_integration_test() {
         std::filesystem::create_directories(download);
         bt::Engine engine([](const std::string&, const nlohmann::json&) {});
         engine.dispatch("engine.initialize", {
-            {"protocolVersion", "1.2"}, {"statePath", path_utf8(temporary.path() / "tracker-state")}});
+            {"protocolVersion", "1.4"}, {"statePath", path_utf8(temporary.path() / "tracker-state")}});
         const auto id = add_torrent_task(engine, public_torrent_path, download);
         std::this_thread::sleep_for(500ms);
         engine.dispatch("engine.configure", {
@@ -822,7 +1227,7 @@ void run_tracker_and_seeding_integration_test() {
         std::filesystem::create_directories(download);
         bt::Engine engine([](const std::string&, const nlohmann::json&) {});
         engine.dispatch("engine.initialize", {
-            {"protocolVersion", "1.2"}, {"statePath", path_utf8(temporary.path() / "private-tracker-state")},
+            {"protocolVersion", "1.4"}, {"statePath", path_utf8(temporary.path() / "private-tracker-state")},
             {"config", {{"additionalTrackers", nlohmann::json::array({private_spy_tracker.announce_url()})}}}});
         const auto observed_before = origin_tracker.observed_peer_count();
         const auto added = engine.dispatch("task.add", {
@@ -870,7 +1275,7 @@ void run_tracker_and_seeding_integration_test() {
                 }
             });
             engine.dispatch("engine.initialize", {
-                {"protocolVersion", "1.2"}, {"statePath", path_utf8(seeding_state_path)},
+                {"protocolVersion", "1.4"}, {"statePath", path_utf8(seeding_state_path)},
                 {"config", {{"seedingEnabled", true}, {"seedRatioLimit", 0.1},
                     {"seedTimeLimitMinutes", 0}}}});
             id = add_torrent_task(engine, seeding_torrent_path, download);
@@ -922,7 +1327,7 @@ void run_tracker_and_seeding_integration_test() {
             }
         });
         const auto initialized = restored.dispatch("engine.initialize", {
-            {"protocolVersion", "1.2"}, {"statePath", path_utf8(seeding_state_path)}});
+            {"protocolVersion", "1.4"}, {"statePath", path_utf8(seeding_state_path)}});
         expect(initialized.at("restoredTasks") == 1, "paused seeding task was not restored");
         expect(restored.dispatch("task.get", {{"id", id}}).at("task").at("state") == "paused",
             "restored seeding task lost its paused state");
@@ -979,7 +1384,7 @@ void run_tracker_and_seeding_integration_test() {
 
         bt::Engine verified([](const std::string&, const nlohmann::json&) {});
         verified.dispatch("engine.initialize", {
-            {"protocolVersion", "1.2"}, {"statePath", path_utf8(seeding_state_path)}});
+            {"protocolVersion", "1.4"}, {"statePath", path_utf8(seeding_state_path)}});
         const auto recovered = verified.dispatch("task.get", {{"id", id}}).at("task");
         expect(recovered.at("state") == "completed" && recovered.at("seedStopReason") == "ratio",
             "completed seeding state was not restored");
@@ -996,9 +1401,10 @@ int main(int argc, char* argv[]) {
         if (argc == 6 && std::string_view(argv[1]) == "--recovery-child") {
             return run_recovery_child(argv[2], argv[3], argv[4], argv[5]);
         }
+        run_http_download_integration_test();
         run_download_integration_test();
         run_tracker_and_seeding_integration_test();
-        std::cout << "Local tracker/seeder integration test passed\n";
+        std::cout << "Local HTTP and tracker/seeder integration tests passed\n";
         return 0;
     } catch (const std::exception& exception) {
         std::cerr << "Integration test failure: " << exception.what() << '\n';
