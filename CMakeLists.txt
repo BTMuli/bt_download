@@ -8,7 +8,7 @@ if(POLICY CMP0207)
     cmake_policy(SET CMP0207 NEW)
 endif()
 
-project(bt_download VERSION 0.1.0 LANGUAGES CXX)
+project(bt_download VERSION 0.2.0 LANGUAGES CXX)
 
 option(BT_DOWNLOAD_BUILD_TESTS "Build bt_download tests" ON)
 option(BT_DOWNLOAD_BUILD_BENCHMARKS "Build bt_download performance benchmarks" ON)
