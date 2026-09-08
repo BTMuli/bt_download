@@ -107,7 +107,7 @@ void run_tabbed_details_tests() {
     {
         bt::Engine engine([](const std::string&, const nlohmann::json&) {});
         engine.dispatch("engine.initialize", {
-            {"protocolVersion", "1.4"}, {"statePath", path_utf8(state_path)}});
+            {"protocolVersion", "1.5"}, {"statePath", path_utf8(state_path)}});
 
         const auto added = engine.dispatch("task.add", {
             {"source", {{"kind", "torrentFile"}, {"path", path_utf8(torrent_path)}}},

@@ -50,7 +50,7 @@ void run_magnet_metadata_tests() {
 
     bt::Engine engine([](const std::string&, const nlohmann::json&) {});
     engine.dispatch("engine.initialize", {
-        {"protocolVersion", "1.4"},
+        {"protocolVersion", "1.5"},
         {"statePath", path_utf8(state_path)},
         {"config", {{"metadataTimeoutSeconds", 1}}},
     });

@@ -82,7 +82,7 @@ void run_proxy_config_tests() {
     TemporaryDirectory temporary;
     bt::Engine engine([](const std::string&, const nlohmann::json&) {});
     const auto initialized = engine.dispatch("engine.initialize", {
-        {"protocolVersion", "1.4"},
+        {"protocolVersion", "1.5"},
         {"statePath", path_utf8(temporary.path())},
         {"proxy", json},
     });

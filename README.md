@@ -16,7 +16,7 @@
 - 按分享率或时间先到即停的限量做种以及跨重启累计；
 - 多文件种子按文件选择与优先级（跳过/下载），随 resume 数据跨重启恢复；
 - 下载详情按 Tab 拆分：`task.details` 返回概览与文件/Peer 总数，`task.files` / `task.peers` 按窗口分页拉取；
-- 协议 `1.4` 与 BangumiToday 随包严格同步，不做旧版本协商或回退；
+- 协议 `1.5` 与 BangumiToday 随包严格同步，不做旧版本协商或回退；
 - HTTP 与 BT 网络可接收应用下发的 Windows 系统代理快照，运行时热更新且不持久化凭据；
 - 本地任务目录与 fast-resume 恢复、稳定错误模型和单调事件序号；
 - HTTP 临时文件恢复、原子完成重命名和精确删除语义；
@@ -47,10 +47,10 @@ Windows Release 发布前应运行独立进程资源基准，采集空闲 CPU/�
 
 ## 最小调用
 
-进程启动后先输出 `event.ready`。客户端随后初始化；`protocolVersion` 必须与引擎协议版本严格一致（当前为 `1.4`）：
+进程启动后先输出 `event.ready`。客户端随后初始化；`protocolVersion` 必须与引擎协议版本严格一致（当前为 `1.5`）：
 
 ```json
-{"jsonrpc":"2.0","id":"1","method":"engine.initialize","params":{"protocolVersion":"1.4","statePath":"C:\\Users\\me\\AppData\\Local\\BangumiToday\\bt_download"}}
+{"jsonrpc":"2.0","id":"1","method":"engine.initialize","params":{"protocolVersion":"1.5","statePath":"C:\\Users\\me\\AppData\\Local\\BangumiToday\\bt_download"}}
 ```
 
 添加任务：

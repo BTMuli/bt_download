@@ -56,7 +56,7 @@ target_link_libraries(bt_download_core
 )
 target_compile_definitions(bt_download_core PUBLIC
     BT_DOWNLOAD_VERSION="${PROJECT_VERSION}"
-    BT_DOWNLOAD_PROTOCOL_VERSION="1.4"
+    BT_DOWNLOAD_PROTOCOL_VERSION="1.5"
     _WIN32_WINNT=0x0A00
 )
 if(MSVC)

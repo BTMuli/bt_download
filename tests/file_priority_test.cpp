@@ -106,7 +106,7 @@ void run_file_priority_tests() {
     {
         bt::Engine engine([](const std::string&, const nlohmann::json&) {});
         engine.dispatch("engine.initialize", {
-            {"protocolVersion", "1.4"}, {"statePath", path_utf8(state_path)}});
+            {"protocolVersion", "1.5"}, {"statePath", path_utf8(state_path)}});
 
         expect_error(dispatch_rpc(engine, "task.setFilePriorities",
             {{"id", "missing"}, {"priorities", {{"0", 0}}}}), "TASK_NOT_FOUND");
@@ -152,7 +152,7 @@ void run_file_priority_tests() {
     {
         bt::Engine engine([](const std::string&, const nlohmann::json&) {});
         engine.dispatch("engine.initialize", {
-            {"protocolVersion", "1.4"}, {"statePath", path_utf8(state_path)}});
+            {"protocolVersion", "1.5"}, {"statePath", path_utf8(state_path)}});
         const auto details = dispatch_rpc(engine, "task.files", {{"id", task_id}});
         const auto& files = details.at("result").at("files");
         expect(files.size() == 2

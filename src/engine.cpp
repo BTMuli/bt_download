@@ -298,6 +298,7 @@ nlohmann::json Engine::dispatch(const std::string& method, const nlohmann::json&
     if (method == "task.peers") return get_task_peers(params);
     if (method == "task.setFilePriorities") return set_file_priorities(params);
     if (method == "task.pause") return pause_task(params);
+    if (method == "task.stop") return pause_task(params, true);
     if (method == "task.resume") return resume_task(params);
     if (method == "task.retry") return retry_task(params);
     if (method == "task.recheck") return recheck_task(params);
@@ -752,6 +753,7 @@ nlohmann::json Engine::add_task(const nlohmann::json& params) {
         task.id = new_task_id();
         task.state = start ? TaskState::queued : TaskState::paused;
         task.source_kind = kind;
+        task.manual = params.value("manual", false);
         task.source = source;
         task.save_path = save_validation.normalized;
         const auto file_name = reserve_http_file_name_locked(
@@ -825,6 +827,7 @@ nlohmann::json Engine::add_task(const nlohmann::json& params) {
     task.id = new_task_id();
     task.state = kind == "magnet" && start ? TaskState::metadata : (start ? TaskState::queued : TaskState::paused);
     task.source_kind = kind;
+    task.manual = params.value("manual", false);
     task.source = source;
     task.save_path = save_validation.normalized;
     task.display_name = params.value("displayName", std::string{});
@@ -1151,7 +1154,7 @@ nlohmann::json Engine::set_file_priorities(const nlohmann::json& params) {
     return {{"priorities", std::move(response_priorities)}};
 }
 
-nlohmann::json Engine::pause_task(const nlohmann::json& params) {
+nlohmann::json Engine::pause_task(const nlohmann::json& params, bool stop) {
     std::scoped_lock lock(mutex_);
     require_initialized();
     auto& task = require_task_locked(params.at("id").get<std::string>());
@@ -1163,7 +1166,7 @@ nlohmann::json Engine::pause_task(const nlohmann::json& params) {
             }
             http_downloads_.cancel(task.id);
             task.download_rate = 0;
-            task.state = TaskState::paused;
+            task.state = stop ? TaskState::stopped : TaskState::paused;
             persist_catalog_locked();
             emit_task("event.taskUpdated", task);
             apply_shared_download_budget_locked();
@@ -1172,8 +1175,12 @@ nlohmann::json Engine::pause_task(const nlohmann::json& params) {
         }
         const auto handle = handles_.find(task.id);
         if (handle == handles_.end()) fail(-32005, "TASK_UNAVAILABLE", "task has no active torrent handle", true);
+        handle->second.unset_flags(lt::torrent_flags::auto_managed);
         handle->second.pause();
-        task.state = TaskState::paused;
+        task.state = stop ? TaskState::stopped : TaskState::paused;
+        task.download_rate = 0;
+        task.upload_rate = 0;
+        resume_after_recheck_.erase(task.id);
         metadata_started_.erase(task.id);
         request_resume_save_locked(task.id, false);
         persist_catalog_locked();
@@ -1186,7 +1193,7 @@ nlohmann::json Engine::resume_task(const nlohmann::json& params) {
     std::scoped_lock lock(mutex_);
     require_initialized();
     auto& task = require_task_locked(params.at("id").get<std::string>());
-    if (task.state == TaskState::paused || task.state == TaskState::error) {
+    if (task.state == TaskState::paused || task.state == TaskState::stopped || task.state == TaskState::error) {
         if (task.source_kind == "http") {
             task.last_error.reset();
             task.state = TaskState::queued;
@@ -1292,6 +1299,9 @@ nlohmann::json Engine::recheck_task(const nlohmann::json& params) {
     std::scoped_lock lock(mutex_);
     require_initialized();
     auto& task = require_task_locked(params.at("id").get<std::string>());
+    if (task.manual && task.state == TaskState::completed) {
+        fail(-32005, "TASK_UNAVAILABLE", "completed manual tasks are archived");
+    }
     if (task.source_kind == "http") {
         fail(-32005, "TASK_UNAVAILABLE",
             "HTTP tasks do not have cryptographic metadata for rechecking");
@@ -1391,12 +1401,12 @@ void Engine::finalize_locked() {
         }
         http_downloads_.cancel(id);
         task.download_rate = 0;
-        if (task.state != TaskState::completed) task.state = TaskState::paused;
+        if (task.state != TaskState::completed && task.state != TaskState::stopped) task.state = TaskState::paused;
     }
     for (auto& [id, handle] : handles_) {
         handle.pause();
         auto& task = tasks_.at(id);
-        if (task.state != TaskState::completed) task.state = TaskState::paused;
+        if (task.state != TaskState::completed && task.state != TaskState::stopped) task.state = TaskState::paused;
     }
     save_final_resume_data_locked();
     persist_catalog_locked();
@@ -1461,6 +1471,12 @@ bool Engine::load_catalog_locked() {
                 if (schema_version == 1 && task.state == TaskState::completed) {
                     task.seed_stop_reason = SeedStopReason::disabled;
                 }
+                // Completed manual tasks are history, not live file references.
+                // Do not restore a torrent handle or touch the payload on disk.
+                if (task.manual && task.state == TaskState::completed && task.source_kind != "http") {
+                    tasks_.emplace(task.id, std::move(task));
+                    continue;
+                }
                 if (task.source_kind == "http") {
                     if (schema_version < 3 || task.source.empty()) {
                         throw std::runtime_error("HTTP task catalog fields are missing");
@@ -1474,6 +1490,11 @@ bool Engine::load_catalog_locked() {
                         || relative.has_root_directory() || !relative.parent_path().empty()
                         || relative == "." || relative == "..") {
                         throw std::runtime_error("HTTP task filename is unsafe");
+                    }
+                    if (task.manual && task.state == TaskState::completed) {
+                        http_file_names_.emplace(task.id, file_name);
+                        tasks_.emplace(task.id, std::move(task));
+                        continue;
                     }
 
                     const auto target = task.save_path / relative;
@@ -1515,7 +1536,7 @@ bool Engine::load_catalog_locked() {
                             task.state = TaskState::error;
                             task.last_error = TaskError{
                                 "DATA_MISSING", "completed HTTP target file is missing", true};
-                        } else if (task.state != TaskState::paused && task.state != TaskState::error) {
+                        } else if (task.state != TaskState::paused && task.state != TaskState::stopped && task.state != TaskState::error) {
                             task.state = TaskState::queued;
                         }
                     }
@@ -1540,7 +1561,7 @@ bool Engine::load_catalog_locked() {
                 add.save_path = path_utf8(task.save_path);
                 add.max_connections = config_.connections_per_task;
                 const bool stage_magnet_metadata = task.source_kind == "magnet"
-                    && task.state != TaskState::paused && task.state != TaskState::completed
+                    && task.state != TaskState::paused && task.state != TaskState::stopped && task.state != TaskState::completed
                     && task.state != TaskState::error;
                 if (stage_magnet_metadata) {
                     add.flags |= lt::torrent_flags::upload_mode;
@@ -1549,9 +1570,10 @@ bool Engine::load_catalog_locked() {
                     add.flags |= lt::torrent_flags::upload_mode;
                     add.flags &= ~lt::torrent_flags::auto_managed;
                 }
-                const bool should_resume = task.state != TaskState::paused
+                const bool should_resume = task.state != TaskState::paused && task.state != TaskState::stopped
                     && task.state != TaskState::completed && task.state != TaskState::error;
                 add.flags |= lt::torrent_flags::paused;
+                if (!should_resume) add.flags &= ~lt::torrent_flags::auto_managed;
                 auto handle = session_->add_torrent(std::move(add), error);
                 if (error) throw std::runtime_error(error.message());
                 apply_additional_trackers_locked(handle, false);
@@ -1684,6 +1706,7 @@ void Engine::fail_task_locked(const std::string& id, std::string code, std::stri
     const auto handle = handles_.find(id);
     if (handle != handles_.end()) handle->second.pause();
     auto& task = tasks_.at(id);
+    if (task.manual && task.state == TaskState::completed) return;
     if (task.source_kind == "http") http_downloads_.cancel(id);
     task.state = TaskState::error;
     task.download_rate = 0;
@@ -1810,6 +1833,8 @@ bool Engine::update_snapshots_locked(bool emit_events) {
     bool catalog_changed = false;
     for (auto& [id, handle] : handles_) {
         auto& task = tasks_.at(id);
+        if ((task.manual && task.state == TaskState::completed)
+            || task.state == TaskState::stopped) continue;
         if (task.source_kind == "magnet" && metadata_started_.contains(id)) {
             if (const auto info = handle.torrent_file()) {
                 if (!validate_magnet_metadata_locked(id, handle, info)) {
@@ -1841,7 +1866,7 @@ bool Engine::update_snapshots_locked(bool emit_events) {
             resume_after_recheck_.erase(id);
             continue;
         }
-        if (task.state == TaskState::seeding
+        if (!task.manual && task.state == TaskState::seeding
             && (status.state == lt::torrent_status::finished || status.state == lt::torrent_status::seeding)) {
             const auto now = std::chrono::steady_clock::now();
             const auto probe = next_payload_probe_.find(id);
@@ -1912,6 +1937,7 @@ bool Engine::update_snapshots_locked(bool emit_events) {
         if (task.state == TaskState::completed
             && (previous_state != TaskState::completed
                 || (handle.flags() & lt::torrent_flags::paused) == lt::torrent_flags_t{})) {
+            handle.unset_flags(lt::torrent_flags::auto_managed);
             handle.pause();
             task.download_rate = 0;
             task.upload_rate = 0;

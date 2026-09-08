@@ -33,6 +33,7 @@ std::string_view to_string(TaskState state) {
     case TaskState::downloading: return "downloading";
     case TaskState::seeding: return "seeding";
     case TaskState::paused: return "paused";
+    case TaskState::stopped: return "stopped";
     case TaskState::completed: return "completed";
     case TaskState::error: return "error";
     }
@@ -46,6 +47,7 @@ TaskState task_state_from_string(std::string_view state) {
     if (state == "downloading") return TaskState::downloading;
     if (state == "seeding") return TaskState::seeding;
     if (state == "paused") return TaskState::paused;
+    if (state == "stopped") return TaskState::stopped;
     if (state == "completed") return TaskState::completed;
     if (state == "error") return TaskState::error;
     throw std::invalid_argument("unknown task state");
@@ -80,6 +82,7 @@ void from_json(const nlohmann::json& json, TaskError& error) {
 void to_json(nlohmann::json& json, const TaskSnapshot& task) {
     json = {
         {"id", task.id}, {"state", to_string(task.state)}, {"sourceKind", task.source_kind},
+        {"manual", task.manual},
         {"savePath", path_utf8(task.save_path)}, {"displayName", task.display_name},
         {"infoHash", task.info_hash.empty() ? nlohmann::json(nullptr) : nlohmann::json(task.info_hash)},
         {"totalBytes", task.total_bytes}, {"downloadedBytes", task.downloaded_bytes},
@@ -99,6 +102,8 @@ void from_json(const nlohmann::json& json, TaskSnapshot& task) {
     json.at("id").get_to(task.id);
     task.state = task_state_from_string(json.at("state").get<std::string>());
     json.at("sourceKind").get_to(task.source_kind);
+    // Catalog migration: tasks created before this field remain tracked.
+    task.manual = json.value("manual", false);
     task.source = json.value("source", std::string{});
     task.save_path = path_from_utf8(json.at("savePath").get<std::string>());
     task.display_name = json.value("displayName", std::string{});
@@ -120,7 +125,7 @@ void from_json(const nlohmann::json& json, TaskSnapshot& task) {
 
 bool can_transition(TaskState from, TaskState to) {
     if (from == to) return true;
-    if (to == TaskState::error || to == TaskState::paused) return from != TaskState::completed;
+    if (to == TaskState::error || to == TaskState::paused || to == TaskState::stopped) return from != TaskState::completed;
     switch (from) {
     case TaskState::metadata: return to == TaskState::checking || to == TaskState::queued;
     case TaskState::checking: return to == TaskState::queued || to == TaskState::downloading
@@ -128,6 +133,7 @@ bool can_transition(TaskState from, TaskState to) {
     case TaskState::queued: return to == TaskState::metadata || to == TaskState::checking || to == TaskState::downloading;
     case TaskState::downloading: return to == TaskState::checking || to == TaskState::seeding || to == TaskState::completed;
     case TaskState::seeding: return to == TaskState::checking || to == TaskState::completed;
+    case TaskState::stopped:
     case TaskState::paused: return to == TaskState::metadata || to == TaskState::checking
         || to == TaskState::queued || to == TaskState::downloading || to == TaskState::seeding;
     case TaskState::error: return to == TaskState::metadata || to == TaskState::checking || to == TaskState::queued;

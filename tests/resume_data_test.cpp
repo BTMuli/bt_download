@@ -91,7 +91,7 @@ void run_resume_data_tests() {
     {
         bt::Engine engine([](const std::string&, const nlohmann::json&) {});
         const auto initialized = engine.dispatch("engine.initialize", {
-            {"protocolVersion", "1.4"}, {"statePath", path_utf8(legacy_state_path)}});
+            {"protocolVersion", "1.5"}, {"statePath", path_utf8(legacy_state_path)}});
         expect(initialized.at("config").at("seedingEnabled") == false,
             "schema 1 migration silently enabled seeding");
         expect(initialized.at("config").at("additionalTrackers").empty(),
@@ -108,7 +108,7 @@ void run_resume_data_tests() {
     {
         bt::Engine engine([](const std::string&, const nlohmann::json&) {});
         engine.dispatch("engine.initialize", {
-            {"protocolVersion", "1.4"}, {"statePath", path_utf8(seeding_state_path)},
+            {"protocolVersion", "1.5"}, {"statePath", path_utf8(seeding_state_path)},
             {"config", {{"seedingEnabled", true}, {"seedRatioLimit", 2.0},
                 {"seedTimeLimitMinutes", 60}}}});
         engine.dispatch("engine.shutdown", nlohmann::json::object());
@@ -135,7 +135,7 @@ void run_resume_data_tests() {
     {
         bt::Engine engine([](const std::string&, const nlohmann::json&) {});
         engine.dispatch("engine.initialize", {
-            {"protocolVersion", "1.4"}, {"statePath", path_utf8(state_path)}});
+            {"protocolVersion", "1.5"}, {"statePath", path_utf8(state_path)}});
         const auto added = engine.dispatch("task.add", {
             {"source", {{"kind", "torrentFile"}, {"path", path_utf8(torrent_path)}}},
             {"savePath", path_utf8(save_path)}, {"start", false}});
@@ -166,7 +166,7 @@ void run_resume_data_tests() {
     {
         bt::Engine engine([](const std::string&, const nlohmann::json&) {});
         const auto initialized = engine.dispatch("engine.initialize", {
-            {"protocolVersion", "1.4"}, {"statePath", path_utf8(state_path)}});
+            {"protocolVersion", "1.5"}, {"statePath", path_utf8(state_path)}});
         expect(initialized.at("restoredTasks") == 1, "resume task was not restored");
         const auto task = engine.dispatch("task.get", {{"id", task_id}}).at("task");
         expect(task.at("state") == "paused", "restored task did not preserve paused state");
@@ -180,7 +180,7 @@ void run_resume_data_tests() {
     {
         bt::Engine engine([](const std::string&, const nlohmann::json&) {});
         const auto initialized = engine.dispatch("engine.initialize", {
-            {"protocolVersion", "1.4"}, {"statePath", path_utf8(state_path)}});
+            {"protocolVersion", "1.5"}, {"statePath", path_utf8(state_path)}});
         expect(initialized.at("restoredTasks") == 1, "damaged resume data prevented source fallback");
         engine.dispatch("engine.shutdown", nlohmann::json::object());
     }
@@ -192,4 +192,66 @@ void run_resume_data_tests() {
         }
     }
     expect(quarantined, "damaged resume data was not quarantined");
+
+    // Stop is persistent and resumable, without pretending the payload completed.
+    {
+        bt::Engine engine([](const std::string&, const nlohmann::json&) {});
+        engine.dispatch("engine.initialize", {
+            {"protocolVersion", "1.5"}, {"statePath", path_utf8(state_path)}});
+        const auto stopped = engine.dispatch("task.stop", {{"id", task_id}}).at("task");
+        expect(stopped.at("state") == "stopped", "task did not stop");
+        expect(engine.dispatch("task.get", {{"id", task_id}}).at("task").at("state") == "stopped",
+            "snapshot overwrote stopped state");
+        engine.dispatch("engine.shutdown", nlohmann::json::object());
+    }
+    {
+        bt::Engine engine([](const std::string&, const nlohmann::json&) {});
+        engine.dispatch("engine.initialize", {
+            {"protocolVersion", "1.5"}, {"statePath", path_utf8(state_path)}});
+        expect(engine.dispatch("task.get", {{"id", task_id}}).at("task").at("state") == "stopped",
+            "restart resumed a stopped task");
+        expect(engine.dispatch("task.resume", {{"id", task_id}}).at("task").at("state") != "stopped",
+            "stopped task could not resume");
+        engine.dispatch("engine.shutdown", nlohmann::json::object());
+    }
+
+    const auto manual_state = temporary.path() / "manual-state";
+    std::string manual_id;
+    {
+        std::ofstream payload(save_path / "payload.bin", std::ios::binary);
+        payload << "resume-data-test";
+    }
+    {
+        bt::Engine engine([](const std::string&, const nlohmann::json&) {});
+        engine.dispatch("engine.initialize", {
+            {"protocolVersion", "1.5"}, {"statePath", path_utf8(manual_state)},
+            {"config", {{"seedingEnabled", false}}}});
+        manual_id = engine.dispatch("task.add", {
+            {"source", {{"kind", "torrentFile"}, {"path", path_utf8(torrent_path)}}},
+            {"savePath", path_utf8(save_path)}, {"manual", true}}).at("task").at("id");
+        nlohmann::json task;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        do {
+            task = engine.dispatch("task.get", {{"id", manual_id}}).at("task");
+            if (task.at("state") == "completed") break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        } while (std::chrono::steady_clock::now() < deadline);
+        expect(task.at("state") == "completed" && task.at("manual") == true,
+            "manual torrent did not complete");
+        std::filesystem::remove(save_path / "payload.bin");
+        expect(engine.dispatch("task.get", {{"id", manual_id}}).at("task").at("state") == "completed",
+            "manual completion changed after deleting payload");
+        engine.dispatch("engine.shutdown", nlohmann::json::object());
+    }
+    std::filesystem::remove(torrent_path);
+    {
+        bt::Engine engine([](const std::string&, const nlohmann::json&) {});
+        engine.dispatch("engine.initialize", {
+            {"protocolVersion", "1.5"}, {"statePath", path_utf8(manual_state)}});
+        const auto task = engine.dispatch("task.get", {{"id", manual_id}}).at("task");
+        expect(task.at("state") == "completed" && task.at("manual") == true,
+            "archived manual torrent tried to restore missing files");
+        expect(task.at("verifiedBytes").get<int>() > 0, "archive lost completion history");
+        engine.dispatch("engine.shutdown", nlohmann::json::object());
+    }
 }

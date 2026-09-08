@@ -47,7 +47,7 @@ private:
     nlohmann::json get_task_files(const nlohmann::json& params);
     nlohmann::json get_task_peers(const nlohmann::json& params);
     nlohmann::json set_file_priorities(const nlohmann::json& params);
-    nlohmann::json pause_task(const nlohmann::json& params);
+    nlohmann::json pause_task(const nlohmann::json& params, bool stop = false);
     nlohmann::json resume_task(const nlohmann::json& params);
     nlohmann::json retry_task(const nlohmann::json& params);
     nlohmann::json recheck_task(const nlohmann::json& params);

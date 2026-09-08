@@ -1,8 +1,8 @@
 # bt_download 本地调用契约
 
-协议版本：`1.4`。传输为继承的 stdin/stdout 管道，编码为 UTF-8，每个 JSON-RPC 2.0 对象独占一行。单帧最大 1 MiB。客户端必须同时持续读取 stdout 和 stderr；stdout 不包含日志。
+协议版本：`1.5`。传输为继承的 stdin/stdout 管道，编码为 UTF-8，每个 JSON-RPC 2.0 对象独占一行。单帧最大 1 MiB。客户端必须同时持续读取 stdout 和 stderr；stdout 不包含日志。
 
-客户端与引擎始终同版本发布，`engine.initialize` 的 `protocolVersion` 必须与引擎协议版本严格一致（`1.4`），不一致返回 `PROTOCOL_MISMATCH`；不再保留旧协议协商或回退路径。
+客户端与引擎始终同版本发布，`engine.initialize` 的 `protocolVersion` 必须与引擎协议版本严格一致（`1.5`），不一致返回 `PROTOCOL_MISMATCH`；不再保留旧协议协商或回退路径。
 
 下载详情按 Tab 拆分：`task.details` 只返回概览（任务、分片状态和文件/Peer 总数），Peer 与文件列表通过 `task.files` / `task.peers` 按需分页拉取。
 
@@ -31,10 +31,19 @@
 | `task.peers` | `id`, 可选 `offset`/`limit` | 按窗口返回当前 Peer，含总数和截断语义 |
 | `task.setFilePriorities` | `id`, `priorities` | 更新多文件任务的单个或多个文件优先级 |
 | `task.pause` / `task.resume` | `id` | 持久暂停或继续 |
+| `task.stop` | `id` | 停止下载与上传，保留数据及记录，状态为 `stopped`；可用 `task.resume` 恢复 |
 | `task.retry` / `task.recheck` | `id` | 重试错误或强制校验 |
 | `task.remove` | `id`, 可选 `deleteData` | 默认只移除任务 |
 
 ### 强制重校验语义
+
+`task.add` 可传 `manual: true` 标记手动添加的任务，默认 `false`；所有任务快照均返回
+`manual` 布尔字段，并持久化到任务目录。旧目录缺少该字段时迁移为 `false`，不猜测来源。
+手动任务不执行后台文件存在性探测；做种策略结束进入 `completed` 后保留为归档记录，
+重启时不读取下载文件或恢复 torrent handle，不提供重新校验。归档前仍按原有做种设置上传，
+上传本身需要访问文件。已归档任务可移除，默认保留文件。
+
+`stopped` 与 `paused` 都禁止自动恢复；停止不表示下载完成。已完成任务停止为无操作。
 
 `task.recheck` 是显式的本地文件完整性校验，不等同于 `task.retry`：
 

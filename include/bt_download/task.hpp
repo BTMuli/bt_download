@@ -16,6 +16,7 @@ enum class TaskState {
     downloading,
     seeding,
     paused,
+    stopped,
     completed,
     error,
 };
@@ -36,6 +37,7 @@ struct TaskSnapshot {
     std::string id;
     TaskState state{TaskState::queued};
     std::string source_kind;
+    bool manual{false};
     std::string source;
     std::filesystem::path save_path;
     std::string display_name;
