@@ -265,7 +265,12 @@ void apply_local_rate_limits(lt::session& session, const EngineConfig& config) {
 
 Engine::Engine(EventSink event_sink)
     : event_sink_(std::move(event_sink)), started_at_(std::chrono::steady_clock::now()),
-      next_resume_save_(started_at_ + resume_save_interval) {}
+      next_resume_save_(started_at_ + resume_save_interval) {
+    http_downloads_.set_file_name_resolver(
+        [this](const std::string& id, std::string_view suggested) {
+            return apply_resolved_http_file_name_locked(id, suggested);
+        });
+}
 
 Engine::~Engine() {
     try {
@@ -512,11 +517,12 @@ std::filesystem::path Engine::http_partial_path_locked(const std::string& id) co
 }
 
 std::string Engine::reserve_http_file_name_locked(const std::filesystem::path& save_path,
-    const std::string& suggested) const {
+    const std::string& suggested, const std::string& except_id) const {
     for (std::size_t suffix = 0; suffix < 10000; ++suffix) {
         const auto candidate = suffixed_file_name(suggested, suffix);
         bool reserved = false;
         for (const auto& [id, file_name] : http_file_names_) {
+            if (id == except_id) continue;
             const auto task = tasks_.find(id);
             if (task != tasks_.end() && task->second.save_path == save_path
                 && file_name == candidate) {
@@ -531,6 +537,42 @@ std::string Engine::reserve_http_file_name_locked(const std::filesystem::path& s
         }
     }
     fail(-32010, "TARGET_FILE_EXISTS", "cannot reserve a unique HTTP target filename");
+}
+
+std::filesystem::path Engine::apply_resolved_http_file_name_locked(
+    const std::string& id, std::string_view suggested) {
+    const auto file_name = http_file_names_.find(id);
+    const auto task = tasks_.find(id);
+    if (file_name == http_file_names_.end() || task == tasks_.end()) {
+        return {};
+    }
+
+    std::string candidate(suggested);
+    if (candidate.empty() || candidate == file_name->second) return {};
+
+    std::string reserved;
+    try {
+        reserved = reserve_http_file_name_locked(task->second.save_path, candidate, id);
+    } catch (...) {
+        return {};
+    }
+    if (reserved.empty() || reserved == file_name->second) return {};
+
+    const auto previous_name = file_name->second;
+    const auto previous_display = task->second.display_name;
+    http_file_names_[id] = reserved;
+    if (task->second.display_name.empty() || task->second.display_name == previous_name) {
+        task->second.display_name = reserved;
+    }
+    try {
+        persist_catalog_locked();
+        emit_task("event.taskUpdated", task->second);
+    } catch (...) {
+        http_file_names_[id] = previous_name;
+        task->second.display_name = previous_display;
+        return {};
+    }
+    return http_partial_path_locked(id);
 }
 
 bool Engine::schedule_http_tasks_locked() {

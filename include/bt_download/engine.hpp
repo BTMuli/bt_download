@@ -12,6 +12,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -76,7 +77,9 @@ private:
     std::filesystem::path http_target_path_locked(const std::string& id) const;
     std::filesystem::path http_partial_path_locked(const std::string& id) const;
     std::string reserve_http_file_name_locked(const std::filesystem::path& save_path,
-        const std::string& suggested) const;
+        const std::string& suggested, const std::string& except_id = {}) const;
+    std::filesystem::path apply_resolved_http_file_name_locked(
+        const std::string& id, std::string_view suggested);
     void fail_task_locked(const std::string& id, std::string code, std::string message, bool retryable);
     bool load_resume_data_locked(const TaskSnapshot& task, libtorrent::add_torrent_params& add);
     void write_resume_data_locked(const std::string& id, const libtorrent::add_torrent_params& add);

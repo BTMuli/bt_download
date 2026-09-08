@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -47,11 +48,16 @@ struct HttpTransferUpdate {
 
 class HttpDownloadManager {
 public:
+    using FileNameResolver = std::function<std::filesystem::path(
+        const std::string& id, std::string_view suggested)>;
+
     HttpDownloadManager();
     ~HttpDownloadManager();
 
     HttpDownloadManager(const HttpDownloadManager&) = delete;
     HttpDownloadManager& operator=(const HttpDownloadManager&) = delete;
+
+    void set_file_name_resolver(FileNameResolver resolver);
 
     std::optional<HttpTransferFailure> start(const std::string& id,
         const std::string& url,
@@ -72,6 +78,10 @@ private:
 
 std::optional<std::string> normalize_http_url(std::string_view value);
 std::string http_file_name_from_url(std::string_view value);
+std::optional<std::string> http_file_name_from_content_disposition(
+    std::string_view value);
+std::string resolve_http_file_name(std::string_view original_url,
+    std::string_view effective_url, std::string_view content_disposition);
 std::optional<std::string> select_http_proxy(
     std::string_view url, const EngineProxyConfig& proxy);
 std::optional<HttpTransferProgress> read_http_transfer_progress(

@@ -227,6 +227,96 @@ std::string safe_http_file_name(std::string value) {
     return value.empty() ? "download" : value;
 }
 
+std::string_view trim_header_value(std::string_view value);
+
+std::string latin1_to_utf8(std::string_view value) {
+    std::string result;
+    result.reserve(value.size() * 2);
+    for (const auto character : value) {
+        const auto byte = static_cast<unsigned char>(character);
+        if (byte < 0x80U) {
+            result.push_back(static_cast<char>(byte));
+        } else {
+            result.push_back(static_cast<char>(0xc0U | (byte >> 6U)));
+            result.push_back(static_cast<char>(0x80U | (byte & 0x3fU)));
+        }
+    }
+    return result;
+}
+
+std::optional<std::string> unquote_http_token(std::string_view value) {
+    value = trim_header_value(value);
+    if (value.empty()) return std::nullopt;
+    if (value.front() != '"') return std::string(value);
+
+    std::string result;
+    result.reserve(value.size());
+    for (std::size_t index = 1; index < value.size(); ++index) {
+        if (value[index] == '\\' && index + 1 < value.size()) {
+            result.push_back(value[index + 1]);
+            ++index;
+        } else if (value[index] == '"') {
+            return result;
+        } else {
+            result.push_back(value[index]);
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<std::string> decode_rfc5987_filename(std::string_view value) {
+    const auto decoded_token = unquote_http_token(value);
+    if (!decoded_token) return std::nullopt;
+    value = *decoded_token;
+    const auto first = value.find('\'');
+    if (first == std::string_view::npos) return std::nullopt;
+    auto charset = lowercase_ascii(std::string(value.substr(0, first)));
+    auto rest = value.substr(first + 1);
+    const auto second = rest.find('\'');
+    if (second == std::string_view::npos) return std::nullopt;
+    const auto decoded = percent_decode(rest.substr(second + 1));
+    if (charset == "utf-8" || charset == "utf8") return decoded;
+    if (charset == "iso-8859-1" || charset == "latin1") return latin1_to_utf8(decoded);
+    return std::nullopt;
+}
+
+void parse_content_disposition_filenames(std::string_view value,
+    std::optional<std::string>& filename, std::optional<std::string>& filename_star) {
+    value = trim_header_value(value);
+    bool quoted = false;
+    bool escaped = false;
+    std::size_t start = 0;
+    const auto consume = [&](std::string_view part) {
+        part = trim_header_value(part);
+        if (part.empty()) return;
+        const auto equals = part.find('=');
+        if (equals == std::string_view::npos) return;
+        auto name = lowercase_ascii(std::string(trim_header_value(part.substr(0, equals))));
+        auto raw = part.substr(equals + 1);
+        if (name == "filename*") {
+            filename_star = std::string(trim_header_value(raw));
+        } else if (name == "filename") {
+            filename = unquote_http_token(raw);
+        }
+    };
+    for (std::size_t index = 0; index <= value.size(); ++index) {
+        const auto ended = index == value.size();
+        const auto character = ended ? '\0' : value[index];
+        if (quoted) {
+            if (escaped) escaped = false;
+            else if (character == '\\') escaped = true;
+            else if (character == '"') quoted = false;
+            continue;
+        }
+        if (character == '"') {
+            quoted = true;
+        } else if (ended || character == ';') {
+            consume(value.substr(start, index - start));
+            start = index + 1;
+        }
+    }
+}
+
 std::FILE* open_partial_file(const std::filesystem::path& path, bool append) {
 #ifdef _WIN32
     return _wfopen(path.c_str(), append ? L"ab" : L"wb");
@@ -448,6 +538,8 @@ struct HttpDownloadManager::Impl {
         std::optional<ContentRange> content_range;
         std::string etag;
         std::string last_modified;
+        std::string content_disposition;
+        std::string effective_url;
         std::string range_option;
         bool disk_checked{false};
         std::optional<HttpTransferFailure> callback_failure;
@@ -460,6 +552,9 @@ struct HttpDownloadManager::Impl {
         std::string user_agent;
         EngineProxyConfig proxy;
         std::filesystem::path partial_path;
+        std::string content_disposition;
+        std::string effective_url;
+        bool file_name_resolved{false};
         TransferMode mode{TransferMode::probe};
         std::size_t max_connections{1};
         std::uint64_t total_bytes{0};
@@ -474,7 +569,38 @@ struct HttpDownloadManager::Impl {
     };
 
     CURLM* multi{nullptr};
+    HttpDownloadManager::FileNameResolver file_name_resolver;
     std::unordered_map<std::string, std::unique_ptr<Transfer>> transfers;
+
+    void capture_response_identity(Request& request) {
+        if (request.easy != nullptr) {
+            char* effective = nullptr;
+            curl_easy_getinfo(request.easy, CURLINFO_EFFECTIVE_URL, &effective);
+            if (effective != nullptr && effective[0] != '\0') {
+                request.effective_url = effective;
+            }
+        }
+        auto& transfer = *request.transfer;
+        if (!request.content_disposition.empty()) {
+            transfer.content_disposition = request.content_disposition;
+        }
+        if (!request.effective_url.empty()) {
+            transfer.effective_url = request.effective_url;
+        }
+    }
+
+    void apply_resolved_file_name(Transfer& transfer) {
+        if (transfer.file_name_resolved || !file_name_resolver) return;
+        transfer.file_name_resolved = true;
+        const auto suggested = resolve_http_file_name(
+            transfer.url, transfer.effective_url, transfer.content_disposition);
+        if (suggested.empty()) return;
+        try {
+            auto new_path = file_name_resolver(transfer.id, suggested);
+            if (!new_path.empty()) transfer.partial_path = std::move(new_path);
+        } catch (...) {
+        }
+    }
 
     static std::size_t write_callback(char* data, std::size_t size,
         std::size_t count, void* context) {
@@ -523,6 +649,7 @@ struct HttpDownloadManager::Impl {
             request.content_range.reset();
             request.etag.clear();
             request.last_modified.clear();
+            request.content_disposition.clear();
             const auto first_space = line.find(' ');
             if (first_space != std::string_view::npos) {
                 long status = 0;
@@ -537,6 +664,8 @@ struct HttpDownloadManager::Impl {
             request.etag = std::string(trim_header_value(line.substr(5)));
         } else if (header_name_is(line, "last-modified:")) {
             request.last_modified = std::string(trim_header_value(line.substr(14)));
+        } else if (header_name_is(line, "content-disposition:")) {
+            request.content_disposition = std::string(trim_header_value(line.substr(20)));
         }
         return bytes;
     }
@@ -882,6 +1011,10 @@ HttpDownloadManager::~HttpDownloadManager() {
     if (impl_->multi != nullptr) curl_multi_cleanup(impl_->multi);
 }
 
+void HttpDownloadManager::set_file_name_resolver(FileNameResolver resolver) {
+    impl_->file_name_resolver = std::move(resolver);
+}
+
 std::optional<HttpTransferFailure> HttpDownloadManager::start(const std::string& id,
     const std::string& url, const std::filesystem::path& partial_path,
     const std::string& user_agent, std::size_t max_connections,
@@ -903,6 +1036,7 @@ std::optional<HttpTransferFailure> HttpDownloadManager::start(const std::string&
         transfer->total_bytes = restored->progress.total_bytes;
         transfer->etag = restored->etag;
         transfer->last_modified = restored->last_modified;
+        transfer->file_name_resolved = true;
         failure = impl_->start_segmented(*transfer, &restored->progress.ranges);
     } else {
         std::error_code error;
@@ -920,6 +1054,7 @@ std::optional<HttpTransferFailure> HttpDownloadManager::start(const std::string&
                     "cannot read HTTP partial file size", true, false};
             }
         }
+        if (legacy_offset > 0) transfer->file_name_resolved = true;
         failure = legacy_offset > 0
             ? impl_->add_sequential(*transfer, legacy_offset)
             : impl_->add_probe(*transfer);
@@ -1034,6 +1169,7 @@ std::vector<HttpTransferUpdate> HttpDownloadManager::poll(std::uint64_t total_ra
             std::max<curl_off_t>(0, speed));
         long status = request.response_status;
         curl_easy_getinfo(request.easy, CURLINFO_RESPONSE_CODE, &status);
+        impl_->capture_response_identity(request);
 
         bool flush_failed = false;
         bool close_failed = false;
@@ -1116,11 +1252,15 @@ std::vector<HttpTransferUpdate> HttpDownloadManager::poll(std::uint64_t total_ra
             if (error) {
                 transfer->failure = HttpTransferFailure{"STORAGE_ERROR",
                     "cannot reset HTTP range state: " + error.message(), true, false};
-            } else if (const auto failure = impl_->add_sequential(*transfer, 0)) {
-                transfer->failure = failure;
+            } else {
+                impl_->apply_resolved_file_name(*transfer);
+                if (const auto failure = impl_->add_sequential(*transfer, 0)) {
+                    transfer->failure = failure;
+                }
             }
         } else if (transfer->probe_ready) {
             transfer->probe_ready = false;
+            impl_->apply_resolved_file_name(*transfer);
             if (const auto failure = impl_->start_segmented(*transfer)) {
                 transfer->failure = failure;
             }
@@ -1262,6 +1402,37 @@ std::string http_file_name_from_url(std::string_view value) {
     const auto slash = path.find_last_of('/');
     const auto segment = slash == std::string::npos ? path : path.substr(slash + 1);
     return safe_http_file_name(percent_decode(segment));
+}
+
+std::optional<std::string> http_file_name_from_content_disposition(
+    std::string_view value) {
+    std::optional<std::string> filename;
+    std::optional<std::string> filename_star;
+    parse_content_disposition_filenames(value, filename, filename_star);
+    if (filename_star) {
+        if (const auto decoded = decode_rfc5987_filename(*filename_star)) {
+            const auto safe = safe_http_file_name(*decoded);
+            if (safe != "download") return safe;
+        }
+    }
+    if (filename && !filename->empty()) {
+        const auto safe = safe_http_file_name(percent_decode(*filename));
+        if (safe != "download") return safe;
+    }
+    return std::nullopt;
+}
+
+std::string resolve_http_file_name(std::string_view original_url,
+    std::string_view effective_url, std::string_view content_disposition) {
+    if (const auto from_header = http_file_name_from_content_disposition(
+            content_disposition)) {
+        return *from_header;
+    }
+    if (!effective_url.empty()) {
+        const auto from_effective = http_file_name_from_url(effective_url);
+        if (from_effective != "download") return from_effective;
+    }
+    return http_file_name_from_url(original_url);
 }
 
 } // namespace bt

@@ -309,6 +309,11 @@ public:
         return "http://127.0.0.1:" + std::to_string(port_) + "/no-range.bin";
     }
 
+    std::string hash_url() const {
+        return "http://127.0.0.1:" + std::to_string(port_)
+            + "/a1b2c3d4e5f67890abcdef1234567890";
+    }
+
     std::uint32_t range_requests() const { return range_requests_.load(); }
     std::uint32_t max_concurrent_requests() const {
         return max_concurrent_requests_.load();
@@ -385,6 +390,10 @@ private:
             if (requested && supports_range) {
                 headers += "Content-Range: bytes " + std::to_string(start) + "-"
                     + std::to_string(end) + "/" + std::to_string(payload_.size()) + "\r\n";
+            }
+            if (request.starts_with("GET /a1b2c3d4e5f67890abcdef1234567890 ")) {
+                headers += "Content-Disposition: attachment; filename=\"Pretty Name.mkv\"; "
+                    "filename*=UTF-8''Pretty%20Name.mkv\r\n";
             }
             headers += "Content-Length: " + std::to_string(end - start + 1)
                 + "\r\nConnection: close\r\n\r\n";
@@ -924,8 +933,10 @@ void run_http_download_integration_test() {
     }
     expect(redirect_completed.at("state") == "completed",
         "redirected HTTP task did not complete");
-    expect(read_bytes(redirect_path / "redirect.bin") == payload,
+    expect(read_bytes(redirect_path / "payload.bin") == payload,
         "HTTP redirect response body polluted the downloaded payload");
+    expect(redirect_completed.at("displayName") == "payload.bin",
+        "redirected HTTP task did not take the final URL filename");
     engine.dispatch("task.remove", {{"id", redirect_id}, {"deleteData", true}});
 
     const auto broken_redirect = engine.dispatch("task.add", {
@@ -945,6 +956,61 @@ void run_http_download_integration_test() {
             && broken_redirect_failed.at("lastError").at("code") == "HTTP_REDIRECT_ERROR",
         "HTTP redirect without Location was not rejected");
     engine.dispatch("task.remove", {{"id", broken_redirect_id}, {"deleteData", true}});
+
+    const auto named_path = temporary.path() / "http-named";
+    std::filesystem::create_directories(named_path);
+    const auto named_added = engine.dispatch("task.add", {
+        {"source", {{"kind", "http"}, {"url", server.hash_url()}}},
+        {"savePath", path_utf8(named_path)},
+    }).at("task");
+    expect(named_added.at("displayName") == "a1b2c3d4e5f67890abcdef1234567890",
+        "HTTP task did not start with the URL filename");
+    const auto named_id = named_added.at("id").get<std::string>();
+    nlohmann::json named_completed;
+    const auto named_deadline = std::chrono::steady_clock::now() + 15s;
+    while (std::chrono::steady_clock::now() < named_deadline) {
+        named_completed = engine.dispatch("task.get", {{"id", named_id}}).at("task");
+        if (named_completed.at("state") == "completed") break;
+        if (named_completed.at("state") == "error") {
+            throw std::runtime_error("HTTP Content-Disposition download failed: "
+                + named_completed.at("lastError").dump());
+        }
+        std::this_thread::sleep_for(50ms);
+    }
+    expect(named_completed.at("state") == "completed"
+            && named_completed.at("displayName") == "Pretty Name.mkv",
+        "HTTP task did not adopt the Content-Disposition filename");
+    expect(read_bytes(named_path / "Pretty Name.mkv") == payload,
+        "HTTP Content-Disposition payload was not saved under the header filename");
+    const auto named_files = engine.dispatch("task.files", {{"id", named_id}});
+    expect(named_files.at("files").at(0).at("path") == "Pretty Name.mkv",
+        "HTTP task file list retained the URL hash name");
+
+    const auto custom_path = temporary.path() / "http-custom-name";
+    std::filesystem::create_directories(custom_path);
+    const auto custom_id = engine.dispatch("task.add", {
+        {"source", {{"kind", "http"}, {"url", server.hash_url()}}},
+        {"savePath", path_utf8(custom_path)},
+        {"displayName", "Custom Task"},
+    }).at("task").at("id").get<std::string>();
+    nlohmann::json custom_completed;
+    const auto custom_deadline = std::chrono::steady_clock::now() + 15s;
+    while (std::chrono::steady_clock::now() < custom_deadline) {
+        custom_completed = engine.dispatch("task.get", {{"id", custom_id}}).at("task");
+        if (custom_completed.at("state") == "completed") break;
+        if (custom_completed.at("state") == "error") {
+            throw std::runtime_error("HTTP custom displayName download failed: "
+                + custom_completed.at("lastError").dump());
+        }
+        std::this_thread::sleep_for(50ms);
+    }
+    expect(custom_completed.at("state") == "completed"
+            && custom_completed.at("displayName") == "Custom Task",
+        "user-provided HTTP displayName was overwritten");
+    expect(read_bytes(custom_path / "Pretty Name.mkv") == payload,
+        "HTTP file was not saved under the Content-Disposition name when displayName was set");
+    engine.dispatch("task.remove", {{"id", named_id}, {"deleteData", true}});
+    engine.dispatch("task.remove", {{"id", custom_id}, {"deleteData", true}});
     engine.dispatch("engine.shutdown", nlohmann::json::object());
 
     bt::Engine restored([](const std::string&, const nlohmann::json&) {});
