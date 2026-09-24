@@ -9,6 +9,9 @@ if(POLICY CMP0207)
 endif()
 
 project(bt_download VERSION 0.2.0 LANGUAGES CXX)
+if(APPLE)
+    enable_language(OBJCXX)
+endif()
 
 option(BT_DOWNLOAD_BUILD_TESTS "Build bt_download tests" ON)
 option(BT_DOWNLOAD_BUILD_BENCHMARKS "Build bt_download performance benchmarks" ON)
@@ -54,6 +57,15 @@ target_link_libraries(bt_download_core
         LibtorrentRasterbar::torrent-rasterbar
         nlohmann_json::nlohmann_json
 )
+if(APPLE)
+    target_sources(bt_download_core PRIVATE src/system_cost.mm)
+    target_link_libraries(bt_download_core PRIVATE "-framework Foundation" "-framework Network")
+else()
+    target_sources(bt_download_core PRIVATE src/system_cost.cpp)
+endif()
+if(WIN32)
+    target_link_libraries(bt_download_core PRIVATE ole32 uuid)
+endif()
 target_compile_definitions(bt_download_core PUBLIC
     BT_DOWNLOAD_VERSION="${PROJECT_VERSION}"
     BT_DOWNLOAD_PROTOCOL_VERSION="1.5"

@@ -33,6 +33,14 @@ EngineConfig apply_config_patch(const EngineConfig& current, const nlohmann::jso
     next.connections_per_task = integer_field(patch, "connectionsPerTask", next.connections_per_task);
     next.metadata_timeout_seconds = integer_field(patch, "metadataTimeoutSeconds", next.metadata_timeout_seconds);
     next.seed_time_limit_minutes = integer_field(patch, "seedTimeLimitMinutes", next.seed_time_limit_minutes);
+    next.constrained_upload_rate_limit = rate_field(patch, "constrainedUploadRateLimit", next.constrained_upload_rate_limit);
+    next.constrained_upload_total_limit = rate_field(patch, "constrainedUploadTotalLimit", next.constrained_upload_total_limit);
+    if (patch.contains("conserveOnMeteredOrLowPower")) {
+        if (!patch.at("conserveOnMeteredOrLowPower").is_boolean()) {
+            throw std::invalid_argument("conserveOnMeteredOrLowPower must be a boolean");
+        }
+        next.conserve_on_metered_or_low_power = patch.at("conserveOnMeteredOrLowPower").get<bool>();
+    }
 
     if (patch.contains("seedingEnabled")) {
         if (!patch.at("seedingEnabled").is_boolean()) {
@@ -65,6 +73,12 @@ EngineConfig apply_config_patch(const EngineConfig& current, const nlohmann::jso
     if (next.metadata_timeout_seconds < 1 || next.metadata_timeout_seconds > 86400) {
         throw std::invalid_argument("metadataTimeoutSeconds must be between 1 and 86400");
     }
+    if (next.constrained_upload_rate_limit < 0 ||
+        next.constrained_upload_rate_limit > std::numeric_limits<int>::max() ||
+        next.constrained_upload_total_limit < 0 ||
+        next.constrained_upload_total_limit > 1024LL * 1024 * 1024 * 1024) {
+        throw std::invalid_argument("constrained upload limits are invalid");
+    }
     if (!std::isfinite(next.seed_ratio_limit)
         || (next.seed_ratio_limit != 0.0
             && (next.seed_ratio_limit < 0.1 || next.seed_ratio_limit > 100.0))) {
@@ -91,6 +105,9 @@ nlohmann::json config_json(const EngineConfig& config) {
         {"seedingEnabled", config.seeding_enabled},
         {"seedRatioLimit", config.seed_ratio_limit},
         {"seedTimeLimitMinutes", config.seed_time_limit_minutes},
+        {"conserveOnMeteredOrLowPower", config.conserve_on_metered_or_low_power},
+        {"constrainedUploadRateLimit", config.constrained_upload_rate_limit},
+        {"constrainedUploadTotalLimit", config.constrained_upload_total_limit},
     };
 }
 

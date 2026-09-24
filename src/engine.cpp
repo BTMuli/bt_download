@@ -4,6 +4,7 @@
 #include "bt_download/protocol.hpp"
 #include "error_mapping.hpp"
 #include "seeding_policy.hpp"
+#include "system_cost.hpp"
 #include "tracker_config.hpp"
 
 #include <algorithm>
@@ -42,6 +43,7 @@ namespace {
 constexpr auto resume_save_interval = std::chrono::seconds(30);
 constexpr auto final_resume_timeout = std::chrono::seconds(10);
 constexpr auto payload_probe_interval = std::chrono::seconds(1);
+constexpr auto system_cost_check_interval = std::chrono::seconds(5);
 constexpr std::uintmax_t max_resume_file_bytes = 64U * 1024U * 1024U;
 constexpr std::size_t max_detail_files = 2000;
 constexpr std::size_t max_detail_peers = 500;
@@ -265,7 +267,7 @@ void apply_local_rate_limits(lt::session& session, const EngineConfig& config) {
 
 Engine::Engine(EventSink event_sink)
     : event_sink_(std::move(event_sink)), started_at_(std::chrono::steady_clock::now()),
-      next_resume_save_(started_at_ + resume_save_interval) {
+      next_resume_save_(started_at_ + resume_save_interval), next_system_cost_check_(started_at_) {
     http_downloads_.set_file_name_resolver(
         [this](const std::string& id, std::string_view suggested) {
             return apply_resolved_http_file_name_locked(id, suggested);
@@ -354,8 +356,9 @@ nlohmann::json Engine::initialize(const nlohmann::json& params) {
             fail(-32602, "INVALID_PROXY", exception.what());
         }
     }
-    session_ = std::make_unique<lt::session>(make_settings(config_, proxy_, user_agent_));
-    apply_local_rate_limits(*session_, config_);
+    refresh_system_cost_locked();
+    session_ = std::make_unique<lt::session>(make_settings(effective_config(), proxy_, user_agent_));
+    apply_local_rate_limits(*session_, effective_config());
     initialized_ = true;
     load_catalog_locked();
     if (has_initial_config) {
@@ -368,8 +371,8 @@ nlohmann::json Engine::initialize(const nlohmann::json& params) {
             initialized_ = false;
             fail(-32602, "INVALID_CONFIG", exception.what());
         }
-        session_->apply_settings(make_settings(config_, proxy_, user_agent_));
-        apply_local_rate_limits(*session_, config_);
+        session_->apply_settings(make_settings(effective_config(), proxy_, user_agent_));
+        apply_local_rate_limits(*session_, effective_config());
         apply_additional_trackers_to_all_locked(false);
         persist_catalog_locked();
     }
@@ -378,7 +381,8 @@ nlohmann::json Engine::initialize(const nlohmann::json& params) {
     return {{"protocolVersion", BT_DOWNLOAD_PROTOCOL_VERSION}, {"engineVersion", BT_DOWNLOAD_VERSION},
             {"libtorrentVersion", LIBTORRENT_VERSION}, {"restoredTasks", tasks_.size()},
             {"features", nlohmann::json::array({"additionalTrackers", "limitedSeeding",
-                "taskDetails", "tabbedDetails", "httpDownloads", "httpMultiConnection", "systemProxy"})},
+                "constrainedUpload", "taskDetails", "tabbedDetails", "httpDownloads",
+                "httpMultiConnection", "systemProxy"})},
             {"config", config_json(config_)}, {"proxy", proxy_status_json(proxy_)}};
 }
 
@@ -394,7 +398,8 @@ nlohmann::json Engine::status() const {
             {"engineVersion", BT_DOWNLOAD_VERSION}, {"libtorrentVersion", LIBTORRENT_VERSION},
             {"uptimeSeconds", uptime}, {"taskCount", tasks_.size()}, {"activeTasks", active},
             {"features", nlohmann::json::array({"additionalTrackers", "limitedSeeding",
-                "taskDetails", "tabbedDetails", "httpDownloads", "httpMultiConnection", "systemProxy"})},
+                "constrainedUpload", "taskDetails", "tabbedDetails", "httpDownloads",
+                "httpMultiConnection", "systemProxy"})},
             {"config", config_json(config_)}, {"proxy", proxy_status_json(proxy_)}};
 }
 
@@ -406,8 +411,8 @@ nlohmann::json Engine::configure(const nlohmann::json& params) {
     } catch (const std::invalid_argument& exception) {
         fail(-32602, "INVALID_CONFIG", exception.what());
     }
-    session_->apply_settings(make_settings(config_, proxy_, user_agent_));
-    apply_local_rate_limits(*session_, config_);
+    session_->apply_settings(make_settings(effective_config(), proxy_, user_agent_));
+    apply_local_rate_limits(*session_, effective_config());
     apply_shared_download_budget_locked();
     apply_additional_trackers_to_all_locked(true);
     update_snapshots_locked(true);
@@ -435,16 +440,52 @@ nlohmann::json Engine::configure_proxy(const nlohmann::json& params) {
     }
     proxy_ = std::move(next);
     session_->pause();
-    session_->apply_settings(make_settings(config_, proxy_, user_agent_));
+    session_->apply_settings(make_settings(effective_config(), proxy_, user_agent_));
     session_->resume();
-    apply_local_rate_limits(*session_, config_);
+    apply_local_rate_limits(*session_, effective_config());
     schedule_http_tasks_locked();
     apply_shared_download_budget_locked();
     return {{"proxy", proxy_status_json(proxy_)}};
 }
 
 bool Engine::effective_seeding_enabled() const noexcept {
-    return config_.seeding_enabled;
+    return config_.seeding_enabled && !(config_.conserve_on_metered_or_low_power && constrained_mode_);
+}
+
+std::optional<SeedStopReason> Engine::seed_stop_reason_for(const TaskSnapshot& task) const {
+    if (!config_.seeding_enabled) return SeedStopReason::disabled;
+    if (config_.conserve_on_metered_or_low_power && constrained_mode_) {
+        return SeedStopReason::constrained;
+    }
+    return evaluate_seed_stop(effective_seeding_enabled(), config_.seed_ratio_limit,
+        config_.seed_time_limit_minutes, task.uploaded_bytes, task.total_bytes,
+        task.seeding_seconds);
+}
+
+EngineConfig Engine::effective_config() const {
+    auto result = config_;
+    if (result.conserve_on_metered_or_low_power && constrained_mode_
+        && result.constrained_upload_rate_limit > 0
+        && (result.upload_rate_limit == 0
+            || result.constrained_upload_rate_limit < result.upload_rate_limit)) {
+        result.upload_rate_limit = result.constrained_upload_rate_limit;
+    }
+    return result;
+}
+
+void Engine::refresh_system_cost_locked() {
+    next_system_cost_check_ = std::chrono::steady_clock::now() + system_cost_check_interval;
+    const auto cost = read_system_cost();
+    const bool constrained = cost.metered || cost.low_power;
+    if (constrained == constrained_mode_) return;
+    constrained_mode_ = constrained;
+    if (session_) {
+        lt::settings_pack settings;
+        settings.set_int(lt::settings_pack::upload_rate_limit,
+            static_cast<int>(effective_config().upload_rate_limit));
+        session_->apply_settings(settings);
+        apply_local_rate_limits(*session_, effective_config());
+    }
 }
 
 void Engine::apply_additional_trackers_locked(const lt::torrent_handle& handle, bool reannounce) {
@@ -1180,6 +1221,7 @@ nlohmann::json Engine::pause_task(const nlohmann::json& params, bool stop) {
         task.state = stop ? TaskState::stopped : TaskState::paused;
         task.download_rate = 0;
         task.upload_rate = 0;
+        task.pause_reason.reset();
         resume_after_recheck_.erase(task.id);
         metadata_started_.erase(task.id);
         request_resume_save_locked(task.id, false);
@@ -1205,6 +1247,7 @@ nlohmann::json Engine::resume_task(const nlohmann::json& params) {
         const auto handle = handles_.find(task.id);
         if (handle == handles_.end()) fail(-32005, "TASK_UNAVAILABLE", "task has no active torrent handle", true);
         task.last_error.reset();
+        task.pause_reason.reset();
         bool metadata_available = task.source_kind != "magnet";
         if (task.source_kind == "magnet") {
             if (const auto info = handle->second.torrent_file()) {
@@ -1231,9 +1274,7 @@ nlohmann::json Engine::resume_task(const nlohmann::json& params) {
                 task.share_ratio = task.total_bytes == 0 ? 0.0
                     : static_cast<double>(task.uploaded_bytes) / static_cast<double>(task.total_bytes);
                 const auto reason = task.seed_stop_reason ? task.seed_stop_reason
-                    : evaluate_seed_stop(effective_seeding_enabled(), config_.seed_ratio_limit,
-                        config_.seed_time_limit_minutes, task.uploaded_bytes, task.total_bytes,
-                        task.seeding_seconds);
+                    : seed_stop_reason_for(task);
                 if (reason) {
                     task.seed_stop_reason = reason;
                     task.state = TaskState::completed;
@@ -1462,8 +1503,8 @@ bool Engine::load_catalog_locked() {
                 config_.seed_ratio_limit = 2.0;
                 config_.seed_time_limit_minutes = 60;
             }
-            session_->apply_settings(make_settings(config_, proxy_, user_agent_));
-            apply_local_rate_limits(*session_, config_);
+            session_->apply_settings(make_settings(effective_config(), proxy_, user_agent_));
+            apply_local_rate_limits(*session_, effective_config());
         }
         for (const auto& item : catalog.value("tasks", nlohmann::json::array())) {
             try {
@@ -1917,12 +1958,16 @@ bool Engine::update_snapshots_locked(bool emit_events) {
         } else if (previous_state == TaskState::completed && next_state != TaskState::checking) {
             next_state = TaskState::completed;
         } else if (next_state == TaskState::seeding) {
-            if (const auto reason = evaluate_seed_stop(effective_seeding_enabled(), config_.seed_ratio_limit,
-                    config_.seed_time_limit_minutes, task.uploaded_bytes, task.total_bytes,
-                    task.seeding_seconds)) {
+            if (const auto reason = seed_stop_reason_for(task)) {
                 task.seed_stop_reason = reason;
                 next_state = TaskState::completed;
             }
+        } else if (next_state == TaskState::downloading
+            && config_.conserve_on_metered_or_low_power && constrained_mode_
+            && config_.constrained_upload_total_limit > 0
+            && task.uploaded_bytes >= static_cast<std::uint64_t>(config_.constrained_upload_total_limit)) {
+            next_state = TaskState::paused;
+            task.pause_reason = "constrainedUploadTotalLimit";
         }
 
         const bool state_changed = next_state != previous_state;
@@ -1937,6 +1982,13 @@ bool Engine::update_snapshots_locked(bool emit_events) {
         if (task.state == TaskState::completed
             && (previous_state != TaskState::completed
                 || (handle.flags() & lt::torrent_flags::paused) == lt::torrent_flags_t{})) {
+            handle.unset_flags(lt::torrent_flags::auto_managed);
+            handle.pause();
+            task.download_rate = 0;
+            task.upload_rate = 0;
+        }
+        if (task.state == TaskState::paused && task.pause_reason
+            && previous_state != TaskState::paused) {
             handle.unset_flags(lt::torrent_flags::auto_managed);
             handle.pause();
             task.download_rate = 0;
@@ -1966,6 +2018,9 @@ void Engine::worker_loop(std::stop_token stop_token) {
         try {
             std::scoped_lock lock(mutex_);
             if (initialized_ && session_) {
+                if (std::chrono::steady_clock::now() >= next_system_cost_check_) {
+                    refresh_system_cost_locked();
+                }
                 process_alerts_locked();
                 request_periodic_resume_saves_locked();
                 bool catalog_changed = update_snapshots_locked(true);

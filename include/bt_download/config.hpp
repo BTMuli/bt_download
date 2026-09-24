@@ -19,6 +19,9 @@ struct EngineConfig {
     bool seeding_enabled{false};
     double seed_ratio_limit{2.0};
     int seed_time_limit_minutes{60};
+    bool conserve_on_metered_or_low_power{false};
+    std::int64_t constrained_upload_rate_limit{4 * 1024 * 1024};
+    std::int64_t constrained_upload_total_limit{200 * 1024 * 1024};
 };
 
 EngineConfig apply_config_patch(const EngineConfig& current, const nlohmann::json& patch);

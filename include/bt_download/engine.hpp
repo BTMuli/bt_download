@@ -72,6 +72,9 @@ private:
     void apply_additional_trackers_to_all_locked(bool reannounce);
     void apply_shared_download_budget_locked();
     bool effective_seeding_enabled() const noexcept;
+    std::optional<SeedStopReason> seed_stop_reason_for(const TaskSnapshot& task) const;
+    EngineConfig effective_config() const;
+    void refresh_system_cost_locked();
     bool schedule_http_tasks_locked();
     bool update_http_tasks_locked(bool emit_events);
     std::filesystem::path http_target_path_locked(const std::string& id) const;
@@ -111,10 +114,12 @@ private:
     std::string user_agent_;
     std::chrono::steady_clock::time_point started_at_;
     std::chrono::steady_clock::time_point next_resume_save_;
+    std::chrono::steady_clock::time_point next_system_cost_check_;
     std::uint64_t sequence_{0};
     std::jthread worker_;
     bool initialized_{false};
     bool shutdown_requested_{false};
+    bool constrained_mode_{false};
 };
 
 } // namespace bt

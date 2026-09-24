@@ -58,6 +58,7 @@ std::string_view to_string(SeedStopReason reason) {
     case SeedStopReason::disabled: return "disabled";
     case SeedStopReason::ratio: return "ratio";
     case SeedStopReason::time: return "time";
+    case SeedStopReason::constrained: return "constrained";
     }
     return "disabled";
 }
@@ -66,6 +67,7 @@ SeedStopReason seed_stop_reason_from_string(std::string_view reason) {
     if (reason == "disabled") return SeedStopReason::disabled;
     if (reason == "ratio") return SeedStopReason::ratio;
     if (reason == "time") return SeedStopReason::time;
+    if (reason == "constrained") return SeedStopReason::constrained;
     throw std::invalid_argument("unknown seed stop reason");
 }
 
@@ -91,6 +93,7 @@ void to_json(nlohmann::json& json, const TaskSnapshot& task) {
         {"seedRatioLimit", task.seed_ratio_limit}, {"seedTimeLimitMinutes", task.seed_time_limit_minutes},
         {"seedStopReason", task.seed_stop_reason
                 ? nlohmann::json(to_string(*task.seed_stop_reason)) : nlohmann::json(nullptr)},
+        {"pauseReason", task.pause_reason ? nlohmann::json(*task.pause_reason) : nlohmann::json(nullptr)},
         {"progress", task.total_bytes == 0 ? 0.0 : static_cast<double>(task.downloaded_bytes) / task.total_bytes},
         {"downloadRate", task.download_rate}, {"uploadRate", task.upload_rate},
         {"peers", task.peers}, {"seeds", task.seeds}, {"private", task.private_torrent},
@@ -118,6 +121,9 @@ void from_json(const nlohmann::json& json, TaskSnapshot& task) {
     task.seed_time_limit_minutes = json.value("seedTimeLimitMinutes", 60);
     if (json.contains("seedStopReason") && !json["seedStopReason"].is_null()) {
         task.seed_stop_reason = seed_stop_reason_from_string(json.at("seedStopReason").get<std::string>());
+    }
+    if (json.contains("pauseReason") && !json["pauseReason"].is_null()) {
+        task.pause_reason = json.at("pauseReason").get<std::string>();
     }
     task.private_torrent = json.value("private", false);
     if (json.contains("lastError") && !json["lastError"].is_null()) task.last_error = json["lastError"].get<TaskError>();

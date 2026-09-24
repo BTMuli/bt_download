@@ -25,6 +25,7 @@ enum class SeedStopReason {
     disabled,
     ratio,
     time,
+    constrained,
 };
 
 struct TaskError {
@@ -51,6 +52,7 @@ struct TaskSnapshot {
     double seed_ratio_limit{2.0};
     int seed_time_limit_minutes{60};
     std::optional<SeedStopReason> seed_stop_reason;
+    std::optional<std::string> pause_reason;
     std::uint64_t download_rate{0};
     std::uint64_t upload_rate{0};
     int peers{0};
