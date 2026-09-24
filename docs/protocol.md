@@ -107,7 +107,7 @@
   `catalog.json`；
 - 非法代理对象返回 `INVALID_PROXY`。PAC/WPAD 与应用现有代理能力一致，暂不支持。
 
-配置字段以字节/秒、秒、分钟和计数为单位：`activeDownloads`、`downloadRateLimit`、`uploadRateLimit`、`connectionsLimit`、`connectionsPerTask`、`metadataTimeoutSeconds`、`additionalTrackers`、`seedingEnabled`、`seedRatioLimit`、`seedTimeLimitMinutes`。速率 `0` 表示不限速；Magnet 元数据超时默认 300 秒，取值范围为 1 至 86400 秒。
+配置字段以字节/秒、字节、秒、分钟和计数为单位：`activeDownloads`、`downloadRateLimit`、`uploadRateLimit`、`connectionsLimit`、`connectionsPerTask`、`metadataTimeoutSeconds`、`additionalTrackers`、`seedingEnabled`、`seedRatioLimit`、`seedTimeLimitMinutes`、`conserveOnMeteredOrLowPower`、`constrainedUploadRateLimit`、`constrainedUploadTotalLimit`。速率 `0` 表示不限速；Magnet 元数据超时默认 300 秒，取值范围为 1 至 86400 秒。
 
 `activeDownloads` 是 BT 与 HTTP 的共享活动任务上限。HTTP 活动任务会占用槽位并
 动态收缩 libtorrent 的下载预算；`downloadRateLimit` 在活动 HTTP 任务间均分，
@@ -129,8 +129,9 @@ Tracker 与做种配置示例：
 - `additionalTrackers` 最多 512 条，只接受合法的 `udp`、`http`、`https` Tracker URL；
 - `seedingEnabled=false` 表示文件完成后立即停止；启用时至少一个停止条件大于 0；
 - 分享率与时间条件同时启用时，任一条件先满足即停止；
+- BangumiToday 默认传入 `conserveOnMeteredOrLowPower=true`，引擎独立启动时默认值为 `false`。系统报告按流量计费或节能模式时，BT 任务下载完成即停止做种；全局上传速率取 `uploadRateLimit` 与 `constrainedUploadRateLimit` 中较严格的非零值（后者默认 4 MiB/s）；单个 BT 任务在下载期间累计上传达到 `constrainedUploadTotalLimit`（默认 200 MiB）后暂停。两个受限值分别以字节/秒和字节计，`0` 表示不设该限制。检测每五秒刷新一次，可能在阈值之后产生少量上传。
 - 配置整体验证并原子生效，非法配置返回 `INVALID_CONFIG`；
-- 任务状态新增 `seeding`，快照新增 `uploadedBytes`、`shareRatio`、`seedingSeconds`、`seedRatioLimit`、`seedTimeLimitMinutes` 和 `seedStopReason`；
+- 任务状态包含 `seeding`，快照包含 `uploadedBytes`、`shareRatio`、`seedingSeconds`、`seedRatioLimit`、`seedTimeLimitMinutes`、`seedStopReason` 和 `pauseReason`。受限状态停止做种时 `seedStopReason=constrained`；累计上传上限暂停时 `pauseReason=constrainedUploadTotalLimit`；
 - 文件完整性校验完成后，状态直接转为 `seeding`，或在禁用/已满足限制时转为 `completed`；客户端可据此发送文件可用通知，不应等待做种结束。
 
 ## 文件选择与优先级
