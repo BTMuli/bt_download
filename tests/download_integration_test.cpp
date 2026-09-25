@@ -1,4 +1,5 @@
 #include "bt_download/engine.hpp"
+#include "bt_download/path_safety.hpp"
 #include "bt_download/protocol.hpp"
 
 #include <atomic>
@@ -1466,6 +1467,138 @@ void run_tracker_and_seeding_integration_test() {
     }
 }
 
+// A healthy seeding task must stay in the seeding state: the payload probe may
+// only re-check when payload files really changed on disk.
+void expect_stable_seeding(bt::Engine& engine, const std::string& id, std::chrono::seconds window) {
+    const auto deadline = std::chrono::steady_clock::now() + window;
+    while (std::chrono::steady_clock::now() < deadline) {
+        const auto state = engine.dispatch("task.get", {{"id", id}})
+            .at("task").at("state").get<std::string>();
+        expect(state == "seeding",
+            "seeding task left the seeding state without a payload change: " + state);
+        std::this_thread::sleep_for(100ms);
+    }
+}
+
+void run_payload_probe_integration_test() {
+    WinsockRuntime winsock;
+    TemporaryDirectory temporary;
+    LocalHttpTracker tracker;
+
+    const auto seed_root = temporary.path() / "probe-seed";
+    lt::settings_pack peer_settings;
+    peer_settings.set_str(lt::settings_pack::listen_interfaces, "127.0.0.1:0");
+    peer_settings.set_bool(lt::settings_pack::enable_dht, false);
+    peer_settings.set_bool(lt::settings_pack::enable_lsd, false);
+    peer_settings.set_bool(lt::settings_pack::enable_upnp, false);
+    peer_settings.set_bool(lt::settings_pack::enable_natpmp, false);
+    lt::session seeder(peer_settings);
+    expect(seeder.listen_port() != 0, "payload probe seeder did not listen");
+    tracker.set_peer_port(seeder.listen_port());
+
+    const auto probe_config = nlohmann::json{
+        {"seedingEnabled", true}, {"seedRatioLimit", 5.0}, {"seedTimeLimitMinutes", 240},
+        {"conserveOnMeteredOrLowPower", false}};
+
+    // Payload paths longer than MAX_PATH: libtorrent reads and writes them
+    // through the extended-length path form, so the probe must do the same or
+    // the completed task looks like a missing payload forever.
+    {
+        const auto download = temporary.path() / "probe-long-download";
+        std::filesystem::create_directories(download);
+        std::string directory_name = "probe-long-path-payload";
+        std::string file_name = "probe-long-path-payload.bin";
+        while ((download / directory_name / file_name).native().size() < 300) {
+            directory_name += "-segment";
+            file_name.insert(file_name.size() - 4, "-segment");
+        }
+        constexpr std::size_t payload_size = 160 * 1024 + 11;
+        const auto source_directory = seed_root / directory_name;
+        write_payload(bt::extended_length_path(source_directory / file_name), payload_size, 101);
+
+        lt::file_storage storage;
+        storage.add_file(directory_name + "/" + file_name,
+            static_cast<std::int64_t>(payload_size));
+        lt::create_torrent torrent(storage, 16 * 1024, lt::create_torrent::v1_only);
+        torrent.add_tracker(tracker.announce_url());
+        torrent.set_creator("bt_download integration test");
+        lt::error_code error;
+        lt::set_piece_hashes(torrent, path_utf8(seed_root), error);
+        expect(!error, "cannot hash long-path integration torrent: " + error.message());
+        const auto torrent_path = temporary.path() / "probe-long-path.torrent";
+        {
+            const auto bytes = torrent.generate_buf();
+            std::ofstream output(torrent_path, std::ios::binary | std::ios::trunc);
+            output.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+            output.close();
+            expect(static_cast<bool>(output), "cannot write long-path integration torrent");
+        }
+        const auto info = std::make_shared<lt::torrent_info>(path_utf8(torrent_path), error);
+        expect(!error, "cannot reopen long-path integration torrent: " + error.message());
+        const auto seed = add_seed(seeder, info, seed_root);
+        wait_for_seeds({seed});
+
+        bt::Engine engine([](const std::string&, const nlohmann::json&) {});
+        engine.dispatch("engine.initialize", {
+            {"protocolVersion", "1.5"},
+            {"statePath", path_utf8(temporary.path() / "probe-long-state")},
+            {"config", probe_config}});
+        const auto id = add_torrent_task(engine, torrent_path, download);
+        wait_for_state(engine, id, "seeding");
+        const auto task = engine.dispatch("task.get", {{"id", id}}).at("task");
+        expect(task.at("downloadedBytes") == task.at("totalBytes"),
+            "long-path payload did not report complete byte counts");
+        const auto payload_path = download / directory_name / file_name;
+        expect(bt::regular_file_size(payload_path).value_or(0) == payload_size,
+            "long-path payload was not written to disk");
+        expect_stable_seeding(engine, id, 4s);
+        engine.dispatch("engine.shutdown", nlohmann::json::object());
+
+        std::error_code cleanup_error;
+        std::filesystem::remove_all(bt::extended_length_path(payload_path.parent_path()),
+            cleanup_error);
+        std::filesystem::remove_all(bt::extended_length_path(source_directory), cleanup_error);
+    }
+
+    // Files that were never selected (priority 0) are not part of the payload
+    // and must not trigger the automatic re-check either.
+    {
+        const auto download = temporary.path() / "probe-select-download";
+        std::filesystem::create_directories(download);
+        const auto source = seed_root / "probe-select";
+        write_payload(source / "keep.bin", 128 * 1024 + 7, 61);
+        write_payload(source / "skip.bin", 64 * 1024 + 3, 67);
+        const auto torrent_path = temporary.path() / "probe-select.torrent";
+        const auto info = create_torrent_file(source, torrent_path, tracker.announce_url());
+        const auto seed = add_seed(seeder, info, seed_root);
+        wait_for_seeds({seed});
+
+        bt::Engine engine([](const std::string&, const nlohmann::json&) {});
+        engine.dispatch("engine.initialize", {
+            {"protocolVersion", "1.5"},
+            {"statePath", path_utf8(temporary.path() / "probe-select-state")},
+            {"config", probe_config}});
+        const auto id = add_torrent_task(engine, torrent_path, download);
+        engine.dispatch("task.setFilePriorities", {{"id", id}, {"priorities", {{"1", 0}}}});
+        wait_for_state(engine, id, "seeding");
+        expect(std::filesystem::is_regular_file(download / "probe-select" / "keep.bin"),
+            "selected payload file was not downloaded");
+        expect(!std::filesystem::exists(download / "probe-select" / "skip.bin"),
+            "unselected payload file was downloaded");
+        const auto task = engine.dispatch("task.get", {{"id", id}}).at("task");
+        const auto keep_bytes = static_cast<std::uint64_t>(
+            std::filesystem::file_size(source / "keep.bin"));
+        const auto skip_bytes = static_cast<std::uint64_t>(
+            std::filesystem::file_size(source / "skip.bin"));
+        const auto wanted_bytes = task.at("totalBytes").get<std::uint64_t>();
+        // Wanted bytes are piece aligned, so the boundary piece may be counted.
+        expect(wanted_bytes >= keep_bytes && wanted_bytes < keep_bytes + skip_bytes,
+            "unselected payload file was counted as wanted data");
+        expect_stable_seeding(engine, id, 4s);
+        engine.dispatch("engine.shutdown", nlohmann::json::object());
+    }
+}
+
 } // namespace
 
 int main(int argc, char* argv[]) {
@@ -1476,6 +1609,7 @@ int main(int argc, char* argv[]) {
         run_http_download_integration_test();
         run_download_integration_test();
         run_tracker_and_seeding_integration_test();
+        run_payload_probe_integration_test();
         std::cout << "Local HTTP and tracker/seeder integration tests passed\n";
         return 0;
     } catch (const std::exception& exception) {

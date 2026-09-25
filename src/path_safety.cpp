@@ -1,11 +1,14 @@
 #include "bt_download/path_safety.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <cstdint>
 #include <iomanip>
+#include <optional>
 #include <random>
 #include <sstream>
+#include <string>
 #include <system_error>
 
 #ifdef _WIN32
@@ -106,6 +109,38 @@ bool is_within(const std::filesystem::path& root, const std::filesystem::path& c
 #endif
     }
     return true;
+}
+
+std::filesystem::path extended_length_path(const std::filesystem::path& path) {
+#ifdef _WIN32
+    const auto& native = path.native();
+    if (!path.is_absolute() || native.rfind(L"\\\\?\\", 0) == 0) return path;
+    std::wstring extended;
+    if (native.rfind(L"\\\\", 0) == 0) {
+        extended.reserve(native.size() + 8);
+        extended = L"\\\\?\\UNC\\";
+        extended.append(native, 2, std::wstring::npos);
+    } else {
+        extended.reserve(native.size() + 4);
+        extended = L"\\\\?\\";
+        extended += native;
+    }
+    // 扩展长度形式不做路径规整，只接受反斜杠分隔符。
+    std::replace(extended.begin(), extended.end(), L'/', L'\\');
+    return std::filesystem::path(extended);
+#else
+    return path;
+#endif
+}
+
+std::optional<std::uintmax_t> regular_file_size(const std::filesystem::path& path) {
+    const auto probe = extended_length_path(path);
+    std::error_code error;
+    if (!std::filesystem::is_regular_file(probe, error) || error) return std::nullopt;
+    error.clear();
+    const auto size = std::filesystem::file_size(probe, error);
+    if (error) return std::nullopt;
+    return size;
 }
 
 } // namespace bt

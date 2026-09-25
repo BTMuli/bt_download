@@ -172,6 +172,6 @@ if(BT_DOWNLOAD_BUILD_TESTS)
     add_test(NAME bt_download_integration_tests COMMAND bt_download_integration_tests)
     set_tests_properties(bt_download_integration_tests PROPERTIES
         LABELS integration
-        TIMEOUT 90
+        TIMEOUT 150
     )
 endif()

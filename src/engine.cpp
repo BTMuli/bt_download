@@ -157,16 +157,20 @@ bool payload_is_missing(const TaskSnapshot& task, const lt::torrent_handle& hand
     const auto info = handle.torrent_file();
     if (!info) return false;
 
-    for (lt::file_index_t index{0}; index < info->files().end_file(); ++index) {
+    // 未选择（优先级 0）的文件不会被下载，不能算作缺失。
+    const auto priorities = handle.get_file_priorities();
+    std::size_t position = 0;
+    for (lt::file_index_t index{0}; index < info->files().end_file(); ++index, ++position) {
         if (info->files().pad_file_at(index)) continue;
+        if (position < priorities.size() && priorities[position] == lt::dont_download) continue;
         const auto expected_size = info->files().file_size(index);
         if (expected_size < 0) return true;
 
+        // 负载路径可能超过 MAX_PATH，必须与 libtorrent 一样按扩展长度形式查询，
+        // 否则已下载完成的多文件任务会被误判为缺失并反复触发重校验。
         const auto path = task.save_path / path_from_utf8(info->files().file_path(index));
-        std::error_code error;
-        if (!std::filesystem::is_regular_file(path, error) || error) return true;
-        const auto actual_size = std::filesystem::file_size(path, error);
-        if (error || actual_size != static_cast<std::uintmax_t>(expected_size)) return true;
+        const auto actual_size = regular_file_size(path);
+        if (!actual_size || *actual_size != static_cast<std::uintmax_t>(expected_size)) return true;
     }
     return false;
 }
