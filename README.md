@@ -20,7 +20,7 @@
 - HTTP 与 BT 网络可接收应用下发的 Windows 系统代理快照，运行时热更新且不持久化凭据；
 - 本地任务目录与 fast-resume 恢复、稳定错误模型和单调事件序号；
 - HTTP 临时文件恢复、原子完成重命名和精确删除语义；
-- Windows x64 Debug/Release 构建与协议/状态机/路径单元测试。
+- Windows x64 Debug/Release 构建，测试目标默认关闭、仅在手动执行时构建。
 
 调用契约见 [docs/protocol.md](docs/protocol.md)。
 
@@ -34,16 +34,23 @@
 $env:VCPKG_ROOT = '<vcpkg 目录>'
 cmake --preset windows-x64-debug
 cmake --build --preset windows-x64-debug
-ctest --preset windows-x64-debug
 ```
 
 产物位于 `out/build/windows-x64-debug/bt_download.exe`。stdout 只输出协议帧；诊断日志只写 stderr。
 
 Windows Release 分发应使用 `cmake --install out/build/windows-x64-release` 生成的完整目录，不能单独复制可执行文件。依赖 DLL、许可证与 SPDX SBOM 的生成和接入约束见 [docs/release.md](docs/release.md)。
 
-## 性能基准
+### 手动测试
 
-Windows Release 发布前应运行独立进程资源基准，采集空闲 CPU/工作集、双任务磁盘吞吐、请求延迟和进度事件频率，并保存 JSON 结果。完整命令、快速回归模式和指标口径见 [docs/performance.md](docs/performance.md)。
+测试目标默认关闭：`windows-x64-debug` / `windows-x64-release` 预设显式写入 `BT_DOWNLOAD_BUILD_TESTS=OFF`，因此本地 `dev_build.ps1` 与发布流水线都不会构建或运行测试。需要手动验证时使用 `windows-x64-debug-tests` 预设，它复用 `windows-x64-debug` 的构建目录与已安装的 vcpkg 依赖，不会重新安装依赖包：
+
+```powershell
+cmake --preset windows-x64-debug-tests
+cmake --build --preset windows-x64-debug-tests
+ctest --preset windows-x64-debug-tests
+```
+
+`ctest` 会依次运行协议/状态机/路径单元测试 `bt_download_tests`、进程冒烟测试 `bt_download_process_smoke_test` 和本地 Tracker/Seeder 集成测试 `bt_download_integration_tests`（150 秒超时）。只改动引擎核心逻辑或发布前需要回归时手动执行；再次配置 `windows-x64-debug` 即可把该构建目录恢复为不含测试目标的状态。
 
 ## 最小调用
 

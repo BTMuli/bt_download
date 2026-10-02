@@ -6,11 +6,10 @@
 
 ## Local Windows toolchain
 
-- `cmake` and `ctest` are not on `PATH` in the agent terminal. Use the Visual Studio copies at:
-  - `D:\IDE\VS26\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe`
-  - `D:\IDE\VS26\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\ctest.exe`
-- Initialize the MSVC environment before building or testing by calling `D:\IDE\VS26\VC\Auxiliary\Build\vcvars64.bat`.
+- `cmake` is not on `PATH` in the agent terminal. Use the Visual Studio copy at
+  `D:\IDE\VS26\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe`.
+- Initialize the MSVC environment before building by calling `D:\IDE\VS26\VC\Auxiliary\Build\vcvars64.bat`.
 - Build the configured Debug preset with:
   `cmd /d /s /c "call D:\IDE\VS26\VC\Auxiliary\Build\vcvars64.bat >nul && D:\IDE\VS26\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe --build --preset windows-x64-debug"`
-- Run its tests with:
-  `cmd /d /s /c "call D:\IDE\VS26\VC\Auxiliary\Build\vcvars64.bat >nul && D:\IDE\VS26\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\ctest.exe --preset windows-x64-debug"`
+- 自动化测试默认关闭：`dev_build.ps1` 与发布流水线只用 `windows-x64-debug` / `windows-x64-release` 预设（显式 `BT_DOWNLOAD_BUILD_TESTS=OFF`），不要在这些预设或 CI 中加入测试步骤。手动验证用 `windows-x64-debug-tests` 预设：
+  `cmd /d /s /c "call D:\IDE\VS26\VC\Auxiliary\Build\vcvars64.bat >nul && set VCPKG_ROOT=D:\IDE\VS26\VC\vcpkg && D:\IDE\VS26\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe --preset windows-x64-debug-tests && D:\IDE\VS26\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe --build --preset windows-x64-debug-tests && D:\IDE\VS26\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\ctest.exe --preset windows-x64-debug-tests"`

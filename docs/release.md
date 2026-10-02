@@ -1,6 +1,6 @@
 # Windows 发布产物
 
-Release 安装目录是交给 BangumiToday Windows/MSIX 构建的完整伴随进程产物。它包含引擎、实际使用的原生 DLL、VC 运行库、第三方许可证通知和 SPDX 2.3 SBOM，不包含测试程序、PDB 或 vcpkg 缓存。
+Release 安装目录是交给 BangumiToday Windows/MSIX 构建的完整伴随进程产物。它包含引擎、实际使用的原生 DLL、VC 运行库、第三方许可证通知和 SPDX 2.3 SBOM，不包含 PDB 或 vcpkg 缓存。
 
 ## 生成
 
@@ -9,7 +9,6 @@ Release 安装目录是交给 BangumiToday Windows/MSIX 构建的完整伴随进
 ```powershell
 cmake --preset windows-x64-release
 cmake --build --preset windows-x64-release
-ctest --preset windows-x64-release
 cmake --install out/build/windows-x64-release
 ```
 

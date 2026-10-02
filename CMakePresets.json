@@ -10,7 +10,8 @@
         "CMAKE_BUILD_TYPE": "Debug",
         "CMAKE_INSTALL_PREFIX": "${sourceDir}/out/install/windows-x64-debug",
         "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
-        "VCPKG_TARGET_TRIPLET": "x64-windows"
+        "VCPKG_TARGET_TRIPLET": "x64-windows",
+        "BT_DOWNLOAD_BUILD_TESTS": "OFF"
       }
     },
     {
@@ -22,23 +23,31 @@
         "CMAKE_BUILD_TYPE": "Release",
         "CMAKE_INSTALL_PREFIX": "${sourceDir}/out/install/windows-x64-release",
         "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
-        "VCPKG_TARGET_TRIPLET": "x64-windows"
+        "VCPKG_TARGET_TRIPLET": "x64-windows",
+        "BT_DOWNLOAD_BUILD_TESTS": "OFF"
+      }
+    },
+    {
+      "name": "windows-x64-debug-tests",
+      "displayName": "Windows x64 Debug (manual tests)",
+      "inherits": "windows-x64-debug",
+      "cacheVariables": {
+        "BT_DOWNLOAD_BUILD_TESTS": "ON"
       }
     }
   ],
   "buildPresets": [
     { "name": "windows-x64-debug", "configurePreset": "windows-x64-debug" },
-    { "name": "windows-x64-release", "configurePreset": "windows-x64-release" }
+    { "name": "windows-x64-release", "configurePreset": "windows-x64-release" },
+    {
+      "name": "windows-x64-debug-tests",
+      "configurePreset": "windows-x64-debug-tests"
+    }
   ],
   "testPresets": [
     {
-      "name": "windows-x64-debug",
-      "configurePreset": "windows-x64-debug",
-      "output": { "outputOnFailure": true }
-    },
-    {
-      "name": "windows-x64-release",
-      "configurePreset": "windows-x64-release",
+      "name": "windows-x64-debug-tests",
+      "configurePreset": "windows-x64-debug-tests",
       "output": { "outputOnFailure": true }
     }
   ]

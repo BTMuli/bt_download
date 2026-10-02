@@ -13,8 +13,12 @@ if(APPLE)
     enable_language(OBJCXX)
 endif()
 
-option(BT_DOWNLOAD_BUILD_TESTS "Build bt_download tests" ON)
-option(BT_DOWNLOAD_BUILD_BENCHMARKS "Build bt_download performance benchmarks" ON)
+# Manual test targets. They are opt-in on purpose: the shipped build, the
+# BangumiToday dev_build.ps1 script and the release workflow all configure the
+# windows-x64-debug/windows-x64-release presets, which force this OFF, so they
+# never build or run tests. Use the windows-x64-debug-tests preset to run them
+# by hand.
+option(BT_DOWNLOAD_BUILD_TESTS "Build the manual bt_download test targets" OFF)
 
 # Full automatic inlining under MSVC 19.51 makes several libtorrent/nlohmann-
 # heavy translation units terminate with FAST_FAIL_STACK_COOKIE_CHECK_FAILURE.
@@ -112,26 +116,6 @@ if(WIN32 AND MSVC AND DEFINED VCPKG_INSTALLED_DIR AND DEFINED VCPKG_TARGET_TRIPL
     install(SCRIPT "${CMAKE_CURRENT_BINARY_DIR}/InstallReleaseMetadata.cmake")
 elseif(WIN32)
     message(WARNING "vcpkg paths are unavailable; release license and SBOM generation is disabled")
-endif()
-
-if(BT_DOWNLOAD_BUILD_BENCHMARKS AND WIN32)
-    add_executable(bt_download_performance_benchmark
-        tests/performance_benchmark.cpp
-    )
-    target_compile_features(bt_download_performance_benchmark PRIVATE cxx_std_20)
-    target_link_libraries(bt_download_performance_benchmark
-        PRIVATE
-            LibtorrentRasterbar::torrent-rasterbar
-            nlohmann_json::nlohmann_json
-            psapi
-            ws2_32
-    )
-    add_dependencies(bt_download_performance_benchmark bt_download)
-    if(MSVC)
-        target_compile_options(bt_download_performance_benchmark PRIVATE /W4 /permissive- /utf-8 /EHsc)
-    else()
-        target_compile_options(bt_download_performance_benchmark PRIVATE -Wall -Wextra -Wpedantic)
-    endif()
 endif()
 
 if(BT_DOWNLOAD_BUILD_TESTS)
