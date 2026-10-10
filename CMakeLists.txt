@@ -8,7 +8,7 @@ if(POLICY CMP0207)
     cmake_policy(SET CMP0207 NEW)
 endif()
 
-project(bt_download VERSION 0.2.0 LANGUAGES CXX)
+project(bt_download VERSION 0.3.0 LANGUAGES CXX)
 if(APPLE)
     enable_language(OBJCXX)
 endif()
