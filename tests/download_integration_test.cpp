@@ -712,7 +712,7 @@ int run_recovery_child(const std::filesystem::path& torrent_path,
     const std::filesystem::path& checkpoint_path) {
     bt::Engine engine([](const std::string&, const nlohmann::json&) {});
     engine.dispatch("engine.initialize", {
-        {"protocolVersion", "1.6"},
+        {"protocolVersion", "1.9"},
         {"statePath", path_utf8(state_path)},
         {"config", {{"activeDownloads", 1}, {"downloadRateLimit", 512 * 1024}}},
     });
@@ -769,7 +769,7 @@ void run_http_download_integration_test() {
 
     bt::Engine engine([](const std::string&, const nlohmann::json&) {});
     engine.dispatch("engine.initialize", {
-        {"protocolVersion", "1.6"},
+        {"protocolVersion", "1.9"},
         {"statePath", path_utf8(state_path)},
         {"config", {{"activeDownloads", 1}, {"downloadRateLimit", 512 * 1024}}},
     });
@@ -869,6 +869,11 @@ void run_http_download_integration_test() {
     expect(completed.at("downloadedBytes") == completed.at("totalBytes"),
         "HTTP task did not report complete byte counts");
     const auto completed_details = engine.dispatch("task.details", {{"id", id}});
+    expect(completed_details.at("httpRangeSupported") == true
+            && completed_details.at("httpTransferMode") == "range"
+            && completed_details.at("httpResponseStatus") == 206
+            && completed_details.at("httpConnections") == 0,
+        "completed HTTP task lost the actual Range diagnostics");
     const auto final_pieces = completed_details.at("completedPieces").get<std::string>();
     expect(!final_pieces.empty()
             && final_pieces.find_first_not_of('1') == std::string::npos,
@@ -897,6 +902,11 @@ void run_http_download_integration_test() {
     }
     expect(fallback_completed.at("state") == "completed",
         "HTTP task did not fall back when Range was unsupported");
+    const auto fallback_details = engine.dispatch("task.details", {{"id", fallback_id}});
+    expect(fallback_details.at("httpRangeSupported") == false
+            && fallback_details.at("httpTransferMode") == "restart"
+            && fallback_details.at("httpResponseStatus") == 200,
+        "HTTP no-range fallback diagnostics were not preserved");
     expect(read_bytes(fallback_path / "no-range.bin") == payload,
         "HTTP no-range fallback payload differs from the server response");
     auto fallback_state = fallback_path
@@ -1019,7 +1029,7 @@ void run_http_download_integration_test() {
 
     bt::Engine restored([](const std::string&, const nlohmann::json&) {});
     restored.dispatch("engine.initialize", {
-        {"protocolVersion", "1.6"}, {"statePath", path_utf8(state_path)}});
+        {"protocolVersion", "1.9"}, {"statePath", path_utf8(state_path)}});
     const auto recovered = restored.dispatch("task.get", {{"id", id}}).at("task");
     const auto manual_recovered = restored.dispatch("task.get", {{"id", custom_id}}).at("task");
     expect(manual_recovered.at("manual") == true && manual_recovered.at("state") == "completed",
@@ -1087,7 +1097,7 @@ void run_download_integration_test() {
     wait_for_seeds({single_seed, bundle_seed, magnet_seed, private_seed, recovery_seed, select_seed});
     bt::Engine engine([](const std::string&, const nlohmann::json&) {});
     engine.dispatch("engine.initialize", {
-        {"protocolVersion", "1.6"},
+        {"protocolVersion", "1.9"},
         {"statePath", path_utf8(temporary.path() / "state")},
         {"config", {{"activeDownloads", 3}, {"metadataTimeoutSeconds", 15}}},
     });
@@ -1217,7 +1227,7 @@ void run_download_integration_test() {
 
     bt::Engine restored([](const std::string&, const nlohmann::json&) {});
     const auto initialized = restored.dispatch("engine.initialize", {
-        {"protocolVersion", "1.6"}, {"statePath", path_utf8(recovery_state)}});
+        {"protocolVersion", "1.9"}, {"statePath", path_utf8(recovery_state)}});
     expect(initialized.at("restoredTasks") == 1, "forced termination task was not restored");
     restored.dispatch("engine.configure", {{"downloadRateLimit", 1024}});
     wait_for_recovered_checkpoint(restored, recovery_id, checkpoint_bytes);
@@ -1282,11 +1292,37 @@ void run_tracker_and_seeding_integration_test() {
         std::filesystem::create_directories(download);
         bt::Engine engine([](const std::string&, const nlohmann::json&) {});
         engine.dispatch("engine.initialize", {
-            {"protocolVersion", "1.6"}, {"statePath", path_utf8(temporary.path() / "tracker-state")}});
+            {"protocolVersion", "1.9"}, {"statePath", path_utf8(temporary.path() / "tracker-state")}});
         const auto id = add_torrent_task(engine, public_torrent_path, download);
         std::this_thread::sleep_for(500ms);
         engine.dispatch("engine.configure", {
-            {"additionalTrackers", nlohmann::json::array({supplemental_tracker.announce_url()})}});
+            {"additionalTrackers", nlohmann::json::array({supplemental_tracker.announce_url()})},
+            {"downloadRateLimit", 64 * 1024}});
+        nlohmann::json linked;
+        const auto link_deadline = std::chrono::steady_clock::now() + 10s;
+        do {
+            linked = engine.dispatch("task.peers", {
+                {"id", id}, {"trackerUrl", supplemental_tracker.announce_url()}, {"limit", 1}});
+            if (!linked.at("peers").empty()) break;
+            std::this_thread::sleep_for(20ms);
+        } while (std::chrono::steady_clock::now() < link_deadline);
+        expect(!linked.at("peers").empty(), "real Tracker response did not create a Peer association");
+        const auto& peer = linked.at("peers")[0];
+        const auto tracker_index = peer.at("trackerIndices")[0].get<std::size_t>();
+        expect(linked.at("trackerUrls")[tracker_index] == supplemental_tracker.announce_url(),
+            "Peer association lost the original Tracker URL");
+        const auto reverse = engine.dispatch("task.trackers", {
+            {"id", id}, {"peerEndpoint", peer.at("endpoint")}});
+        expect(!reverse.at("trackers").empty(), "reverse Peer -> Tracker association was empty");
+        for (const auto& row : reverse.at("trackers")) {
+            expect(row.at("url") == supplemental_tracker.announce_url(),
+                "reverse association included a Tracker that did not return the peer");
+        }
+        const auto unrelated = engine.dispatch("task.peers", {
+            {"id", id}, {"trackerUrl", origin_tracker.announce_url()}});
+        expect(unrelated.at("totalPeers") == 0 && unrelated.at("peers").empty(),
+            "generic Tracker source flag was misattributed to an unrelated Tracker");
+        engine.dispatch("engine.configure", {{"downloadRateLimit", 0}});
         const auto task = wait_for_completion(engine, id, supplemental_tracker, public_seed);
         expect(task.at("seedStopReason") == "disabled",
             "safe default did not stop seeding");
@@ -1300,7 +1336,7 @@ void run_tracker_and_seeding_integration_test() {
         std::filesystem::create_directories(download);
         bt::Engine engine([](const std::string&, const nlohmann::json&) {});
         engine.dispatch("engine.initialize", {
-            {"protocolVersion", "1.6"}, {"statePath", path_utf8(temporary.path() / "private-tracker-state")},
+            {"protocolVersion", "1.9"}, {"statePath", path_utf8(temporary.path() / "private-tracker-state")},
             {"config", {{"additionalTrackers", nlohmann::json::array({private_spy_tracker.announce_url()})}}}});
         const auto observed_before = origin_tracker.observed_peer_count();
         const auto added = engine.dispatch("task.add", {
@@ -1348,7 +1384,7 @@ void run_tracker_and_seeding_integration_test() {
                 }
             });
             engine.dispatch("engine.initialize", {
-                {"protocolVersion", "1.6"}, {"statePath", path_utf8(seeding_state_path)},
+                {"protocolVersion", "1.9"}, {"statePath", path_utf8(seeding_state_path)},
                 {"config", {{"seedingEnabled", true}, {"seedRatioLimit", 0.1},
                     {"seedTimeLimitMinutes", 0}}}});
             id = add_torrent_task(engine, seeding_torrent_path, download);
@@ -1400,7 +1436,7 @@ void run_tracker_and_seeding_integration_test() {
             }
         });
         const auto initialized = restored.dispatch("engine.initialize", {
-            {"protocolVersion", "1.6"}, {"statePath", path_utf8(seeding_state_path)}});
+            {"protocolVersion", "1.9"}, {"statePath", path_utf8(seeding_state_path)}});
         expect(initialized.at("restoredTasks") == 1, "paused seeding task was not restored");
         expect(restored.dispatch("task.get", {{"id", id}}).at("task").at("state") == "paused",
             "restored seeding task lost its paused state");
@@ -1457,7 +1493,7 @@ void run_tracker_and_seeding_integration_test() {
 
         bt::Engine verified([](const std::string&, const nlohmann::json&) {});
         verified.dispatch("engine.initialize", {
-            {"protocolVersion", "1.6"}, {"statePath", path_utf8(seeding_state_path)}});
+            {"protocolVersion", "1.9"}, {"statePath", path_utf8(seeding_state_path)}});
         const auto recovered = verified.dispatch("task.get", {{"id", id}}).at("task");
         expect(recovered.at("state") == "completed" && recovered.at("seedStopReason") == "ratio",
             "completed seeding state was not restored");
@@ -1540,7 +1576,7 @@ void run_payload_probe_integration_test() {
 
         bt::Engine engine([](const std::string&, const nlohmann::json&) {});
         engine.dispatch("engine.initialize", {
-            {"protocolVersion", "1.6"},
+            {"protocolVersion", "1.9"},
             {"statePath", path_utf8(temporary.path() / "probe-long-state")},
             {"config", probe_config}});
         const auto id = add_torrent_task(engine, torrent_path, download);
@@ -1575,7 +1611,7 @@ void run_payload_probe_integration_test() {
 
         bt::Engine engine([](const std::string&, const nlohmann::json&) {});
         engine.dispatch("engine.initialize", {
-            {"protocolVersion", "1.6"},
+            {"protocolVersion", "1.9"},
             {"statePath", path_utf8(temporary.path() / "probe-select-state")},
             {"config", probe_config}});
         const auto id = add_torrent_task(engine, torrent_path, download);

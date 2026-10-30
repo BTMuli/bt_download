@@ -1,0 +1,83 @@
+--- a/include/libtorrent/extensions.hpp
++++ b/include/libtorrent/extensions.hpp
+@@ -173,6 +173,8 @@
+ #include "libtorrent/socket.hpp"
+ #include "libtorrent/error_code.hpp"
+ 
++#define BT_DOWNLOAD_LIBTORRENT_TRACKER_PEERS_VERSION 1
++
+ namespace libtorrent {
+ 
+ #ifndef TORRENT_DISABLE_EXTENSIONS
+@@ -376,6 +378,10 @@
+ 		// peer. For peer source flags, see peer_info::peer_source_flags.
+ 		virtual void on_add_peer(tcp::endpoint const&,
+ 			peer_source_flags_t, add_peer_flags_t) {}
++
++		// Observation only: this exact tracker returned the endpoint. Hostname
++		// peers are reported after resolution with their original tracker URL.
++		virtual void on_tracker_peer(string_view, tcp::endpoint const&) {}
+ 	};
+ 
+ 	// peer plugins are associated with a specific peer. A peer could be
+--- a/include/libtorrent/torrent.hpp
++++ b/include/libtorrent/torrent.hpp
+@@ -950,7 +950,8 @@
+ 		void on_peer_name_lookup(error_code const&
+ 			, std::vector<address> const&
+ 			, int port
+-			, protocol_version);
++			, protocol_version
++			, std::string const& tracker_url);
+ 
+ 		// this is the asio callback that is called when a name
+ 		// lookup for a WEB SEED is completed.
+--- a/src/torrent.cpp
++++ b/src/torrent.cpp
+@@ -3595,7 +3595,7 @@
+ 			{
+ 				ADD_OUTSTANDING_ASYNC("torrent::on_peer_name_lookup");
+ 				m_ses.get_resolver().async_resolve(i.hostname, aux::resolver_interface::abort_on_shutdown
+-					, std::bind(&torrent::on_peer_name_lookup, shared_from_this(), _1, _2, i.port, v));
++					, std::bind(&torrent::on_peer_name_lookup, shared_from_this(), _1, _2, i.port, v, r.url));
+ 			}
+ 		}
+ 
+@@ -3632,12 +3632,18 @@
+ 		for (auto const& i : resp.peers4)
+ 		{
+ 			tcp::endpoint const a(address_v4(i.ip), i.port);
++#ifndef TORRENT_DISABLE_EXTENSIONS
++			for (auto const& ext : m_extensions) ext->on_tracker_peer(r.url, a);
++#endif
+ 			need_update |= bool(add_peer(a, peer_info::tracker, flags) != nullptr);
+ 		}
+ 
+ 		for (auto const& i : resp.peers6)
+ 		{
+ 			tcp::endpoint const a(address_v6(i.ip), i.port);
++#ifndef TORRENT_DISABLE_EXTENSIONS
++			for (auto const& ext : m_extensions) ext->on_tracker_peer(r.url, a);
++#endif
+ 			need_update |= bool(add_peer(a, peer_info::tracker, flags) != nullptr);
+ 		}
+ 
+@@ -3867,7 +3873,7 @@
+ 
+ 	void torrent::on_peer_name_lookup(error_code const& e
+ 		, std::vector<address> const& host_list, int const port
+-		, protocol_version const v) try
++		, protocol_version const v, std::string const& tracker_url) try
+ 	{
+ 		TORRENT_ASSERT(is_single_thread());
+ 
+@@ -3884,6 +3890,9 @@
+ 
+ 		// TODO: add one peer per IP the hostname resolves to
+ 		tcp::endpoint host(host_list.front(), std::uint16_t(port));
++#ifndef TORRENT_DISABLE_EXTENSIONS
++		for (auto const& ext : m_extensions) ext->on_tracker_peer(tracker_url, host);
++#endif
+ 
+ 		if (m_ip_filter && m_ip_filter->access(host.address()) & ip_filter::blocked)
+ 		{

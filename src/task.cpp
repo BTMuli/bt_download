@@ -90,6 +90,7 @@ void to_json(nlohmann::json& json, const TaskSnapshot& task) {
         {"totalBytes", task.total_bytes}, {"downloadedBytes", task.downloaded_bytes},
         {"verifiedBytes", task.verified_bytes}, {"uploadedBytes", task.uploaded_bytes},
         {"shareRatio", task.share_ratio}, {"seedingSeconds", task.seeding_seconds},
+        {"downloadMilliseconds", task.download_milliseconds},
         {"seedRatioLimit", task.seed_ratio_limit}, {"seedTimeLimitMinutes", task.seed_time_limit_minutes},
         {"seedStopReason", task.seed_stop_reason
                 ? nlohmann::json(to_string(*task.seed_stop_reason)) : nlohmann::json(nullptr)},
@@ -117,6 +118,12 @@ void from_json(const nlohmann::json& json, TaskSnapshot& task) {
     task.uploaded_bytes = json.value("uploadedBytes", std::uint64_t{0});
     task.share_ratio = json.value("shareRatio", 0.0);
     task.seeding_seconds = json.value("seedingSeconds", std::uint64_t{0});
+    const auto& download_time = json.at("downloadMilliseconds");
+    if (!download_time.is_number_integer()
+        || (!download_time.is_number_unsigned() && download_time.get<std::int64_t>() < 0)) {
+        throw std::invalid_argument("downloadMilliseconds must be a non-negative integer");
+    }
+    task.download_milliseconds = download_time.get<std::uint64_t>();
     task.seed_ratio_limit = json.value("seedRatioLimit", 2.0);
     task.seed_time_limit_minutes = json.value("seedTimeLimitMinutes", 60);
     if (json.contains("seedStopReason") && !json["seedStopReason"].is_null()) {

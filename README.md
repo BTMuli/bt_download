@@ -10,13 +10,20 @@
 - 普通 HTTP(S) 文件直链、Range 断点续传及安全目标文件命名；
 - 查询、暂停、继续、重试、重新校验和移除任务；
 - info-hash + 规范化保存路径去重；
+- 单任务累计下载耗时，零速度暂停计时，毫秒累计及原子检查点随任务跨重启保留；
 - 下载目录可写检查和种子内部路径穿越检查；
 - 全局并发、速度和连接数限制；
 - 公共任务补充 Tracker 的校验、动态替换与私有种子隔离；
 - 按分享率或时间先到即停的限量做种以及跨重启累计；
 - 多文件种子按文件选择与优先级（跳过/下载），随 resume 数据跨重启恢复；
 - 下载详情按 Tab 拆分：`task.details` 返回概览与文件/Peer 总数，`task.files` / `task.peers` 按窗口分页拉取；
-- 协议 `1.6` 与 BangumiToday 随包严格同步，不做旧版本协商或回退；
+- 协议 `1.9` 与 BangumiToday 随包严格同步，不做旧版本协商或回退；
+- 元数据阶段可查询 Peer 身份与连接诊断；`task.trackers` 分页展示逐接口/协议的 Tracker
+  状态，`task.reannounce` 请求重汇报并遵守最小间隔；
+- Tracker 与 Peer 双向关联查询：记录真实响应的 URL 与节点地址，支持多来源、分页前
+  筛选、30 分钟过期及每任务 2 万条容量限制；同页 URL 字典去重传输；
+- `task.details` 报告实际 HTTP Range 能力、传输模式与响应状态，`engine.status.network`
+  提供监听、DHT 节点、发现开关与端口映射的运行诊断；
 - HTTP 与 BT 网络可接收应用下发的 Windows 系统代理快照，运行时热更新且不持久化凭据；
 - 本地任务目录与 fast-resume 恢复、稳定错误模型和单调事件序号；
 - HTTP 临时文件恢复、原子完成重命名和精确删除语义；
@@ -29,6 +36,8 @@
 ## 构建
 
 需要 Visual Studio（Desktop development with C++）、CMake、Ninja 和 vcpkg。依赖由 `vcpkg.json` 固定。
+`vcpkg-configuration.json` 自动应用 [libtorrent 观察回调 overlay](vcpkg-ports/README.md)，
+首次配置会重建该依赖；引擎须与带补丁的 libtorrent DLL 一起分发。
 
 ```powershell
 $env:VCPKG_ROOT = '<vcpkg 目录>'
@@ -54,10 +63,10 @@ ctest --preset windows-x64-debug-tests
 
 ## 最小调用
 
-进程启动后先输出 `event.ready`。客户端随后初始化；`protocolVersion` 必须与引擎协议版本严格一致（当前为 `1.6`）：
+进程启动后先输出 `event.ready`。客户端随后初始化；`protocolVersion` 必须与引擎协议版本严格一致（当前为 `1.9`）：
 
 ```json
-{"jsonrpc":"2.0","id":"1","method":"engine.initialize","params":{"protocolVersion":"1.6","statePath":"C:\\Users\\me\\AppData\\Local\\BangumiToday\\bt_download"}}
+{"jsonrpc":"2.0","id":"1","method":"engine.initialize","params":{"protocolVersion":"1.9","statePath":"C:\\Users\\me\\AppData\\Local\\BangumiToday\\bt_download"}}
 ```
 
 添加任务：

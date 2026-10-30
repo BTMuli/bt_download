@@ -36,6 +36,7 @@ find_package(nlohmann_json CONFIG REQUIRED)
 
 add_library(bt_download_core
     src/config.cpp
+    src/download_timer.cpp
     src/engine.cpp
     src/error_mapping.cpp
     src/error_message.cpp
@@ -47,6 +48,8 @@ add_library(bt_download_core
     src/seeding_policy.cpp
     src/task.cpp
     src/tracker_config.cpp
+    src/tracker_peer_store.cpp
+    src/tracker_peers.cpp
 )
 if(MSVC AND MSVC_VERSION EQUAL 1951)
     # The expanded engine implementation still triggers the compiler/runtime
@@ -74,7 +77,7 @@ if(WIN32)
 endif()
 target_compile_definitions(bt_download_core PUBLIC
     BT_DOWNLOAD_VERSION="${PROJECT_VERSION}"
-    BT_DOWNLOAD_PROTOCOL_VERSION="1.6"
+    BT_DOWNLOAD_PROTOCOL_VERSION="1.9"
     _WIN32_WINNT=0x0A00
 )
 if(MSVC)
@@ -124,6 +127,7 @@ if(BT_DOWNLOAD_BUILD_TESTS)
     enable_testing()
     add_executable(bt_download_tests
         tests/config_test.cpp
+        tests/download_timer_test.cpp
         tests/file_priority_test.cpp
         tests/http_download_test.cpp
         tests/test_main.cpp
@@ -135,6 +139,7 @@ if(BT_DOWNLOAD_BUILD_TESTS)
         tests/resume_data_test.cpp
         tests/tabbed_details_test.cpp
         tests/task_test.cpp
+        tests/tracker_peers_test.cpp
         tests/user_agent_test.cpp
     )
     target_link_libraries(bt_download_tests PRIVATE bt_download_core)

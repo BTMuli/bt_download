@@ -1,12 +1,13 @@
 # bt_download 本地调用契约
 
-协议版本：`1.6`。传输为继承的 stdin/stdout 管道，编码为 UTF-8，每个 JSON-RPC 2.0 对象独占一行。单帧最大 1 MiB。客户端必须同时持续读取 stdout 和 stderr；stdout 不包含日志。
+协议版本：`1.9`。传输为继承的 stdin/stdout 管道，编码为 UTF-8，每个 JSON-RPC 2.0 对象独占一行。单帧最大 1 MiB。客户端必须同时持续读取 stdout 和 stderr；stdout 不包含日志。
 
 Windows 系统错误先从 Unicode 消息转换为 UTF-8，保留本地化内容。远端或未知来源的显示
 文本仍可能含非法 UTF-8 字节，输出 JSON 和持久化目录时将这些字节替换为 U+FFFD，
 保留合法 UTF-8、有效条目和业务字段，避免整帧失败并误报 `INVALID_PARAMS`。
+输入 JSON 仍严格解析，不放宽客户端必传字段或类型约束。
 
-客户端与引擎始终同版本发布，`engine.initialize` 的 `protocolVersion` 必须与引擎协议版本严格一致（`1.6`），不一致返回 `PROTOCOL_MISMATCH`；不再保留旧协议协商或回退路径。
+客户端与引擎始终同版本发布，`engine.initialize` 的 `protocolVersion` 必须与引擎协议版本严格一致（`1.9`），不一致返回 `PROTOCOL_MISMATCH`；不再保留旧协议协商或回退路径。
 
 下载详情按 Tab 拆分：`task.details` 只返回概览（任务、分片状态和文件/Peer 总数），Peer 与文件列表通过 `task.files` / `task.peers` 按需分页拉取。
 
@@ -32,7 +33,9 @@ Windows 系统错误先从 Unicode 消息转换为 UTF-8，保留本地化内容
 | `task.get` | `id` | 返回单任务快照 |
 | `task.details` | `id` | 返回任务快照、分片完成状态和文件/Peer 总数（不携带列表） |
 | `task.files` | `id`, 可选 `offset`/`limit` | 按窗口返回文件进度与优先级，含总数和截断语义 |
-| `task.peers` | `id`, 可选 `offset`/`limit` | 按窗口返回当前 Peer，含总数和截断语义 |
+| `task.peers` | `id`, 可选 `offset`/`limit`/`trackerUrl` | 返回分页 Peer，可按具体 Tracker 筛选 |
+| `task.trackers` | `id`, 可选 `offset`/`limit`/`peerEndpoint` | 按本地接口及 v1/v2 返回 Tracker，可按关联 Peer 筛选 |
+| `task.reannounce` | `id` | 请求任务重新汇报，遵守 Tracker 的最小间隔 |
 | `task.setFilePriorities` | `id`, `priorities` | 更新多文件任务的单个或多个文件优先级 |
 | `task.pause` / `task.resume` | `id` | 持久暂停或继续 |
 | `task.stop` | `id` | 停止下载与上传，保留数据及记录，状态为 `stopped`；可用 `task.resume` 恢复 |
@@ -198,7 +201,7 @@ Tracker 与做种配置示例：
 ```
 
 ```json
-{"id":"2","jsonrpc":"2.0","result":{"task":{...},"pieceLength":16384,"pieceCount":1024,"completedPieces":"0101...","totalFiles":42,"contentFiles":31,"totalPeers":37,"httpConnections":0,"files":[],"filesTruncated":false,"peers":[],"peersTruncated":false}}
+{"id":"2","jsonrpc":"2.0","result":{"task":{...},"pieceLength":16384,"pieceCount":1024,"completedPieces":"0101...","totalFiles":42,"contentFiles":31,"totalPeers":37,"httpConnections":0,"httpRangeSupported":null,"httpTransferMode":"unknown","httpResponseStatus":null,"files":[],"filesTruncated":false,"peers":[],"peersTruncated":false}}
 ```
 
 `task.files` / `task.peers` 使用相同的窗口语义：`offset` 默认 `0`，`limit` 默认分别是 `2000` 与 `500`（也是单次窗口上限）。`filesTruncated` / `peersTruncated` 表示当前窗口之后仍有数据；此时 `nextOffset` 为下一页起点，否则为 `null`：
@@ -213,9 +216,13 @@ Tracker 与做种配置示例：
 
 - `offset` 必须是非负整数，`limit` 必须是 `1` 到窗口上限的整数，否则返回 `INVALID_PAGINATION`；
 - 窗口起点等于或超过总数时返回空列表且 `*Truncated=false`、`nextOffset=null`；
-- BT 元数据不可用时文件与 Peer 列表为空、总数与窗口为 `0`；HTTP 任务始终按
-  单文件返回；
-- 两个列表均为当前时刻的快照，Peer 列表分页在连接变化时可能移动窗口，客户端应仅用于展示；
+- BT 元数据不可用时仅文件与分片信息为空；`task.peers` 仍返回连接中、握手中和已连接的
+  节点与已知身份，`task.details.totalPeers` 使用当前已连接节点计数；HTTP 任务按单文件返回；
+- 两个列表均为当前时刻的快照。Peer 列表先按端点排序，连接变化时仍可能移动窗口，
+  不提供跨请求的一致快照。BangumiToday 文件页按排除 padding 的真实文件每页 50 个展示，
+  缓存真实文件到原始索引的映射，刷新当前页对应的引擎窗口；Peer 每页 100 个，刷新当前页，
+  Peer 当前页失效时回到首页；排序、客户端筛选及批量文件选择均只作用于本页。
+  文件选择使用原始全局索引映射，隐藏 padding、按真实文件分页和排序后仍保留该索引；
 
 Tracker 列表源、自动更新时间和最后同步错误由 BangumiToday 管理，不通过本地引擎协议传输。引擎未收到 `seedingEnabled` 时使用安全默认值 `false`；BangumiToday 客户端负责在新安装且用户已确认提示后显式传入产品默认值 `true`、`2.0` 和 `60`。
 
@@ -234,11 +241,117 @@ Tracker 列表源、自动更新时间和最后同步错误由 BangumiToday 管�
   的 `A2-MAJOR-MINOR-PATCH-` 格式。识别结果不等同于对端真实软件身份。
 
 ```json
-{"endpoint":"127.0.0.1:6881","userAgent":"BangumiToday/0.8.0","peerId":"2d4c54323043302d303132333435363738396162","peerIdClient":"libtorrent 2.0.12","progress":0.5,"downloadRate":1024,"uploadRate":0}
+{"endpoint":"127.0.0.1:6881","userAgent":"BangumiToday/0.8.0","peerId":"2d4c54323043302d303132333435363738396162","peerIdClient":"libtorrent 2.0.12","progress":0.5,"downloadRate":1024,"uploadRate":0,"choked":true,"interested":true,"remoteChoked":false,"remoteInterested":false,"connectionState":"connected","seed":false,"transport":"tcp","encryption":"none","sources":["tracker"],"trackerIndices":[0]}
 ```
 
 扩展握手观察器随新建及恢复的 BT 任务注册，只记录声明，不修改 Peer ID、扩展协商或
 传输行为。声明随连接销毁，重连时重新收集，Web Seed 不会被当作 BT 客户端声明。
+
+### Peer 连接诊断（1.7）
+
+Peer 条目还必须包含 `choked`（本端阻止对端下载）、`interested`（本端感兴趣）、
+`remoteChoked`（对端阻止本端下载）、`remoteInterested`、`seed`，类型均为 bool。
+`connectionState` 为 `connecting` / `handshake` / `connected`，
+`transport` 为 `tcp` / `utp` / `webSeed`，`encryption` 为
+`none` / `handshake`（仅握手混淆）/ `rc4` / `tls`。
+`sources` 为发现来源字符串数组，可包含 `tracker`、`dht`、`pex`、`lsd`、
+`resumeData`、`incoming`，无来源信息时为空数组。
+
+### 任务 Tracker（1.7）
+
+`task.trackers` 返回 `{"trackers":[...],"totalTrackers":N,"offset":0,"nextOffset":null}`，
+HTTP 任务返回空数组、总数为 0。窗口参数校验与文件/Peer 相同，默认及最大 limit 为 100，
+避免大量 Tracker 的重复 URL 与接口状态超过单帧上限。分页按当前采样展开后的行数计数。
+每行代表一个 Tracker 的一个本地监听接口及一个有效的 BT 协议版本；尚无接口时
+提供一行等待状态，此时 `endpoint` / `protocol` 为空。字段全部必传：
+
+- `url` 为 Tracker 服务器地址；`tier` 为层级；`endpoint` 为本地汇报接口的地址及监听端口，
+  不是 Tracker 服务器地址；`protocol` 为 `v1` / `v2` / 空。
+- `state`：`waiting` / `updating` / `working` / `error` / `paused` / `disabled`。
+- `lastError`：最后错误文本，无错误时为空；`message`：Tracker 返回的警告或消息。
+- `nextAnnounceSeconds`：采样时距下次汇报的秒数（同时考虑最小间隔），未安排或暂停时为 null。
+- `peers`：该接口和协议版本最近一次 Tracker 响应返回的节点数，尚无响应时为 null。
+  该值不代表新连接数，也不使用 scrape 的种子数代替。
+
+`task.reannounce` 返回 `{"scheduled":true}`，表示请求已排入 libtorrent；不会绕过
+最小间隔，不保证立即收到响应。HTTP 返回 `SOURCE_UNSUPPORTED`，暂停任务返回 `TASK_PAUSED`。
+查询和重汇报不会添加 Tracker，沿用现有隐私种子及磁力元数据阶段的 Tracker 隔离规则。
+
+### Tracker 与 Peer 关联（1.8）
+
+`task.peers` 顶层必传 `trackerUrls` 字符串数组，同页各 Peer 的 `trackerIndices` 必传整数
+数组，引用此响应内的 URL 字典；索引仅在当前响应有效。客户端解析成每个 Peer 独立的
+URL 列表，不以通用的 `sources: ["tracker"]` 或连接时间猜测具体来源。HTTP/空页的字典
+和各 Peer 无记录时的索引均为空数组。上方 Peer 示例的索引 0 引用顶层字典的首个 URL。
+
+引擎通过随包 libtorrent overlay 的观察回调，记录真实 compact IPv4/IPv6 Tracker
+响应，以及非 compact 节点异步地址解析完成后的原请求 URL；不额外发起汇报或改变节点
+选择。一个 Peer 可以关联多个 Tracker，这表示该 Tracker 近期返回过该地址，不表示
+它是首次发现来源、唯一来源或当前传输的中转服务器。入站连接的临时端口、DHT/PEX
+节点及重启前的历史可能没有可匹配记录，空数组不表示这些节点从未来自 Tracker。
+
+每任务记录最多 20,000 个“地址 + URL”组合，按每条最后返回时间保留 30 分钟；重复返回
+会刷新时间与 LRU 顺序，达到上限淘汰最久未返回的记录。不持久化，移除任务/关闭引擎
+清理；从任务移除的 Tracker 不再作为有效关联返回。URL 字典避免逐 Peer 重复传输地址。
+
+`task.peers.trackerUrl` 按完整 URL 精确匹配，在计数和分页之前筛选；`totalPeers`、
+`nextOffset` 与 `peersTruncated` 均描述筛选后的窗口。`task.trackers.peerEndpoint`
+按 `task.peers.endpoint` 的原始地址精确匹配，先筛 Tracker URL，再展开接口/协议和分页。
+不传筛选参数时沿用全量查询，未知或过期关联返回空页。界面支持 Tracker 详情跳转到
+关联 Peer、Peer 行跳转到关联 Tracker，以及返回和清除筛选；关联筛选跨页生效。
+
+新增回调改变 libtorrent 插件接口，必须使用 `vcpkg-configuration.json` 的 overlay
+同时重建引擎和依赖 DLL，不能复用未打补丁的 libtorrent。详见
+[overlay 说明](../vcpkg-ports/README.md)。协议仍按同版本发布，不增加旧协议回退。
+
+### HTTP 实际传输状态（1.7）
+
+`task.details` 必传以下字段（BT 任务固定为 null / `unknown` / null）：
+
+- `httpRangeSupported`：bool 或 null。实际响应确认 Range 支持或拒绝；尚未确认时为 null。
+- `httpTransferMode`：`probing`、`range`、`resuming`、`sequential`、`restart`、`unknown`。
+  `restart` 表示本次传输已从区间下载或续传降级为从头下载，资源版本变化也可能触发它。
+- `httpResponseStatus`：最近结束请求的最终 HTTP 状态码；尚未收到响应时为 null。
+  探测尚未结束时可报告当前最终响应头，重定向的中间状态不会作为最终值展示。
+
+暂停、出错和完成后保留本进程最近一次诊断，活动连接数归零；删除任务清理诊断缓存。
+
+### 单任务下载耗时（1.9）
+
+所有任务快照必传非负整数 `downloadMilliseconds`，表示该任务累计记录的下载毫秒数，
+与预计剩余时间、做种时间分别存储。只有 `state=downloading` 且 `downloadRate>0` 时
+计时；速度为零、暂停、停止、排队、校验、做种、完成和错误期间不增长。重试及继续
+沿用同一任务累计值，删除任务时清理。
+
+引擎按单调时钟消费互不重叠的采样区间，保留不足一毫秒的余数；快照采样约每 500 ms
+一次。查询、事件和保存共用同一个任务计时器，不按刷新次数追加固定时长。状态切换时
+结算上一段活跃区间，应用关闭期间不计入；重启只恢复累计值，运行期时钟锚点不写磁盘。
+
+累计值写入 catalog schema 4。正常退出在等待 resume 数据前保存，下载期间每 5 秒
+检查一次脏数据并原子保存；强制终止可能丢失最近一次检查点后的增量。schema 1–3
+迁移将此前未记录的耗时初始化为 0，不根据任务年龄或下载字节推算历史耗时。前端将
+累计值显示在单任务卡片的预计耗时旁及详情信息页，不自行启动计时或累加。
+跨进程恢复时，已有有效区间状态可证明此前使用过 Range；其余未知诊断不会推断为成功。
+
+### 引擎网络诊断（1.7）
+
+`engine.status.network`（初始化响应也提供）包含以下必传字段：
+
+- `listening`、`listenPort`：当前实际监听状态和端口。
+- `dhtEnabled`、`dhtRunning`、`dhtNodes`（未运行时 null）、`dhtSampled`：生效设置、
+  运行状态、各本地 DHT 实例路由表的活动节点数合计及是否已采样。异步采样约每 5 秒刷新。
+- `lsdEnabled`、`upnpEnabled`、`natPmpEnabled`：libtorrent 当前生效设置。
+- `listeners`：最近监听结果，含 `address`、`port`、`socketType`（可读字符串）、
+  `state`（`listening` / `error`）、`error`。
+- `portMappings`：最近端口映射结果，含 `address`、`transport`（`upnp` / `natPmp`）、
+  `state`（`mapped` / `error`）、`externalPort`（失败时 null）、`error`。
+
+监听或端口映射成功不能证明公网入站已可达；查询不发起公网探测。代理配置变化会清理旧的
+DHT 与映射采样，代理关闭的发现和映射能力按生效设置显示。前端在下载设置中按需查询。
+
+`task.retry` 只允许 `state=error` 且 `lastError.retryable=true` 的任务；否则分别返回
+`TASK_NOT_FAILED` 或 `TASK_NOT_RETRYABLE`。可重试不代表错误条件已消失：磁盘空间、
+权限、目录或网络需要先恢复。修改源或保存路径通过重新添加任务完成，重试不修改它们。
 
 ## 错误
 

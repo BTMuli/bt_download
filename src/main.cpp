@@ -15,7 +15,7 @@ int main() {
         {"protocolVersion", BT_DOWNLOAD_PROTOCOL_VERSION}, {"engineVersion", BT_DOWNLOAD_VERSION},
         {"features", nlohmann::json::array({"additionalTrackers", "limitedSeeding", "filePriorities",
             "taskDetails", "tabbedDetails", "httpDownloads", "httpMultiConnection",
-            "systemProxy"})}});
+            "systemProxy", "peerIdentity", "networkDiagnostics", "taskTrackers", "trackerPeerLinks"})}});
     const int result = server.run();
     if (!engine.shutdown_requested()) engine.dispatch("engine.shutdown", nlohmann::json::object());
     return result;

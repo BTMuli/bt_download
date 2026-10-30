@@ -91,7 +91,7 @@ void run_resume_data_tests() {
     {
         bt::Engine engine([](const std::string&, const nlohmann::json&) {});
         const auto initialized = engine.dispatch("engine.initialize", {
-            {"protocolVersion", "1.6"}, {"statePath", path_utf8(legacy_state_path)}});
+            {"protocolVersion", "1.9"}, {"statePath", path_utf8(legacy_state_path)}});
         expect(initialized.at("config").at("seedingEnabled") == false,
             "schema 1 migration silently enabled seeding");
         expect(initialized.at("config").at("additionalTrackers").empty(),
@@ -101,14 +101,14 @@ void run_resume_data_tests() {
     {
         std::ifstream migrated_catalog(legacy_state_path / "catalog.json", std::ios::binary);
         const auto migrated = nlohmann::json::parse(migrated_catalog);
-        expect(migrated.at("schemaVersion") == 3, "schema 1 catalog was not migrated to schema 3");
+        expect(migrated.at("schemaVersion") == 4, "schema 1 catalog was not migrated to schema 4");
     }
 
     const auto seeding_state_path = temporary.path() / "seeding-state";
     {
         bt::Engine engine([](const std::string&, const nlohmann::json&) {});
         engine.dispatch("engine.initialize", {
-            {"protocolVersion", "1.6"}, {"statePath", path_utf8(seeding_state_path)},
+            {"protocolVersion", "1.9"}, {"statePath", path_utf8(seeding_state_path)},
             {"config", {{"seedingEnabled", true}, {"seedRatioLimit", 2.0},
                 {"seedTimeLimitMinutes", 60}}}});
         engine.dispatch("engine.shutdown", nlohmann::json::object());
@@ -135,7 +135,7 @@ void run_resume_data_tests() {
     {
         bt::Engine engine([](const std::string&, const nlohmann::json&) {});
         engine.dispatch("engine.initialize", {
-            {"protocolVersion", "1.6"}, {"statePath", path_utf8(state_path)}});
+            {"protocolVersion", "1.9"}, {"statePath", path_utf8(state_path)}});
         const auto added = engine.dispatch("task.add", {
             {"source", {{"kind", "torrentFile"}, {"path", path_utf8(torrent_path)}}},
             {"savePath", path_utf8(save_path)}, {"start", false}});
@@ -166,7 +166,7 @@ void run_resume_data_tests() {
     {
         bt::Engine engine([](const std::string&, const nlohmann::json&) {});
         const auto initialized = engine.dispatch("engine.initialize", {
-            {"protocolVersion", "1.6"}, {"statePath", path_utf8(state_path)}});
+            {"protocolVersion", "1.9"}, {"statePath", path_utf8(state_path)}});
         expect(initialized.at("restoredTasks") == 1, "resume task was not restored");
         const auto task = engine.dispatch("task.get", {{"id", task_id}}).at("task");
         expect(task.at("state") == "paused", "restored task did not preserve paused state");
@@ -180,7 +180,7 @@ void run_resume_data_tests() {
     {
         bt::Engine engine([](const std::string&, const nlohmann::json&) {});
         const auto initialized = engine.dispatch("engine.initialize", {
-            {"protocolVersion", "1.6"}, {"statePath", path_utf8(state_path)}});
+            {"protocolVersion", "1.9"}, {"statePath", path_utf8(state_path)}});
         expect(initialized.at("restoredTasks") == 1, "damaged resume data prevented source fallback");
         engine.dispatch("engine.shutdown", nlohmann::json::object());
     }
@@ -197,7 +197,7 @@ void run_resume_data_tests() {
     {
         bt::Engine engine([](const std::string&, const nlohmann::json&) {});
         engine.dispatch("engine.initialize", {
-            {"protocolVersion", "1.6"}, {"statePath", path_utf8(state_path)}});
+            {"protocolVersion", "1.9"}, {"statePath", path_utf8(state_path)}});
         const auto stopped = engine.dispatch("task.stop", {{"id", task_id}}).at("task");
         expect(stopped.at("state") == "stopped", "task did not stop");
         expect(engine.dispatch("task.get", {{"id", task_id}}).at("task").at("state") == "stopped",
@@ -207,7 +207,7 @@ void run_resume_data_tests() {
     {
         bt::Engine engine([](const std::string&, const nlohmann::json&) {});
         engine.dispatch("engine.initialize", {
-            {"protocolVersion", "1.6"}, {"statePath", path_utf8(state_path)}});
+            {"protocolVersion", "1.9"}, {"statePath", path_utf8(state_path)}});
         expect(engine.dispatch("task.get", {{"id", task_id}}).at("task").at("state") == "stopped",
             "restart resumed a stopped task");
         expect(engine.dispatch("task.resume", {{"id", task_id}}).at("task").at("state") != "stopped",
@@ -224,7 +224,7 @@ void run_resume_data_tests() {
     {
         bt::Engine engine([](const std::string&, const nlohmann::json&) {});
         engine.dispatch("engine.initialize", {
-            {"protocolVersion", "1.6"}, {"statePath", path_utf8(manual_state)},
+            {"protocolVersion", "1.9"}, {"statePath", path_utf8(manual_state)},
             {"config", {{"seedingEnabled", false}}}});
         manual_id = engine.dispatch("task.add", {
             {"source", {{"kind", "torrentFile"}, {"path", path_utf8(torrent_path)}}},
@@ -245,13 +245,47 @@ void run_resume_data_tests() {
     }
     std::filesystem::remove(torrent_path);
     {
+        std::ifstream input(manual_state / "catalog.json", std::ios::binary);
+        auto catalog = nlohmann::json::parse(input);
+        catalog.at("tasks")[0]["downloadMilliseconds"] = 123456;
+        input.close();
+        std::ofstream output(manual_state / "catalog.json", std::ios::binary | std::ios::trunc);
+        output << catalog.dump(2);
+    }
+    {
         bt::Engine engine([](const std::string&, const nlohmann::json&) {});
         engine.dispatch("engine.initialize", {
-            {"protocolVersion", "1.6"}, {"statePath", path_utf8(manual_state)}});
+            {"protocolVersion", "1.9"}, {"statePath", path_utf8(manual_state)}});
         const auto task = engine.dispatch("task.get", {{"id", manual_id}}).at("task");
         expect(task.at("state") == "completed" && task.at("manual") == true,
             "archived manual torrent tried to restore missing files");
         expect(task.at("verifiedBytes").get<int>() > 0, "archive lost completion history");
+        expect(task.at("downloadMilliseconds") == 123456,
+            "restart lost the per-task download timer");
+        for (int i = 0; i < 5; ++i) {
+            expect(engine.dispatch("task.get", {{"id", manual_id}}).at("task").at("downloadMilliseconds")
+                    == 123456,
+                "repeated reads counted time for an inactive task");
+        }
+        engine.dispatch("engine.shutdown", nlohmann::json::object());
+    }
+    {
+        std::ifstream input(manual_state / "catalog.json", std::ios::binary);
+        auto catalog = nlohmann::json::parse(input);
+        expect(catalog.at("tasks")[0].at("downloadMilliseconds") == 123456,
+            "repeated persistence duplicated the download timer");
+        catalog["schemaVersion"] = 3;
+        catalog.at("tasks")[0].erase("downloadMilliseconds");
+        input.close();
+        std::ofstream output(manual_state / "catalog.json", std::ios::binary | std::ios::trunc);
+        output << catalog.dump(2);
+    }
+    {
+        bt::Engine engine([](const std::string&, const nlohmann::json&) {});
+        engine.dispatch("engine.initialize", {
+            {"protocolVersion", "1.9"}, {"statePath", path_utf8(manual_state)}});
+        expect(engine.dispatch("task.get", {{"id", manual_id}}).at("task").at("downloadMilliseconds") == 0,
+            "catalog migration invented historical download time");
         engine.dispatch("engine.shutdown", nlohmann::json::object());
     }
 }

@@ -383,6 +383,8 @@ std::optional<StoredTransferState> load_transfer_state(
         if (json.at("version") != 1) return std::nullopt;
 
         StoredTransferState state;
+        state.progress.range_supported = true;
+        state.progress.mode = "range";
         state.progress.total_bytes = json.at("totalBytes").get<std::uint64_t>();
         state.etag = json.value("etag", std::string{});
         state.last_modified = json.value("lastModified", std::string{});
@@ -566,6 +568,8 @@ struct HttpDownloadManager::Impl {
         bool probe_ready{false};
         bool fallback_requested{false};
         bool fallback_used{false};
+        std::optional<bool> range_supported;
+        long response_status{0};
         std::optional<HttpTransferFailure> failure;
         std::chrono::steady_clock::time_point next_persist{};
     };
@@ -573,6 +577,7 @@ struct HttpDownloadManager::Impl {
     CURLM* multi{nullptr};
     HttpDownloadManager::FileNameResolver file_name_resolver;
     std::unordered_map<std::string, std::unique_ptr<Transfer>> transfers;
+    mutable std::unordered_map<std::string, HttpTransferProgress> last_progress;
 
     void capture_response_identity(Request& request) {
         if (request.easy != nullptr) {
@@ -968,7 +973,16 @@ struct HttpDownloadManager::Impl {
     HttpTransferProgress progress(const Transfer& transfer) const {
         HttpTransferProgress result;
         result.total_bytes = transfer.total_bytes;
+        result.range_supported = transfer.range_supported;
+        result.response_status = transfer.response_status;
+        result.mode = transfer.mode == TransferMode::probe ? "probing"
+            : transfer.mode == TransferMode::segmented ? "range"
+            : transfer.fallback_used ? "restart"
+            : !transfer.requests.empty() && transfer.requests.front()->start > 0 ? "resuming" : "sequential";
         for (const auto& request : transfer.requests) {
+            if (result.response_status == 0 && request->response_status >= 200) {
+                result.response_status = request->response_status;
+            }
             if (request->easy != nullptr) ++result.active_connections;
             if (transfer.mode == TransferMode::segmented) {
                 const auto downloaded = (std::min)(
@@ -984,6 +998,8 @@ struct HttpDownloadManager::Impl {
                 }
             }
         }
+        last_progress[transfer.id] = result;
+        last_progress[transfer.id].active_connections = 0;
         return result;
     }
 
@@ -1035,6 +1051,7 @@ std::optional<HttpTransferFailure> HttpDownloadManager::start(const std::string&
 
     std::optional<HttpTransferFailure> failure;
     if (const auto restored = load_transfer_state(partial_path)) {
+        transfer->range_supported = true;
         transfer->total_bytes = restored->progress.total_bytes;
         transfer->etag = restored->etag;
         transfer->last_modified = restored->last_modified;
@@ -1090,6 +1107,7 @@ std::optional<std::string> select_http_proxy(
 bool HttpDownloadManager::cancel(const std::string& id) {
     const auto found = impl_->transfers.find(id);
     if (found == impl_->transfers.end()) return false;
+    (void)impl_->progress(*found->second);
     if (found->second->mode == Impl::TransferMode::segmented) {
         (void)impl_->persist_state(*found->second);
     }
@@ -1102,6 +1120,10 @@ bool HttpDownloadManager::contains(const std::string& id) const {
     return impl_->transfers.contains(id);
 }
 
+void HttpDownloadManager::forget_progress(const std::string& id) {
+    impl_->last_progress.erase(id);
+}
+
 std::size_t HttpDownloadManager::active_count() const noexcept {
     return impl_->transfers.size();
 }
@@ -1109,7 +1131,11 @@ std::size_t HttpDownloadManager::active_count() const noexcept {
 std::optional<HttpTransferProgress> HttpDownloadManager::progress(
     const std::string& id) const {
     const auto found = impl_->transfers.find(id);
-    if (found == impl_->transfers.end()) return std::nullopt;
+    if (found == impl_->transfers.end()) {
+        const auto previous = impl_->last_progress.find(id);
+        if (previous != impl_->last_progress.end()) return previous->second;
+        return std::nullopt;
+    }
     return impl_->progress(*found->second);
 }
 
@@ -1171,6 +1197,14 @@ std::vector<HttpTransferUpdate> HttpDownloadManager::poll(std::uint64_t total_ra
             std::max<curl_off_t>(0, speed));
         long status = request.response_status;
         curl_easy_getinfo(request.easy, CURLINFO_RESPONSE_CODE, &status);
+        transfer.response_status = status;
+        if (status == 206 && request.content_range
+            && request.kind == Impl::RequestKind::sequential) {
+            transfer.range_supported = true;
+        }
+        if (status == 200 && (request.kind != Impl::RequestKind::sequential || request.start > 0)) {
+            transfer.range_supported = false;
+        }
         impl_->capture_response_identity(request);
 
         bool flush_failed = false;
@@ -1220,6 +1254,7 @@ std::vector<HttpTransferUpdate> HttpDownloadManager::poll(std::uint64_t total_ra
                 transfer.fallback_requested = true;
             } else {
                 transfer.total_bytes = request.content_range->total;
+                transfer.range_supported = true;
                 transfer.etag = request.etag;
                 transfer.last_modified = request.last_modified;
                 transfer.probe_ready = true;

@@ -1,0 +1,2 @@
+# Patch context must preserve upstream indentation and blank lines.
+vcpkg-ports/**/*.patch text eol=lf whitespace=-blank-at-eol,-space-before-tab

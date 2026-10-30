@@ -63,6 +63,8 @@ std::filesystem::path create_multi_file_torrent(const std::filesystem::path& dir
     files.add_file("multi/keep.bin", static_cast<std::int64_t>(std::size(keep) - 1));
     files.add_file("multi/skip.bin", static_cast<std::int64_t>(std::size(skip) - 1));
     lt::create_torrent torrent(files, 16 * 1024, lt::create_torrent::v1_only);
+    torrent.add_tracker("http://127.0.0.1:1/announce", 0);
+    torrent.add_tracker("http://127.0.0.1:2/announce", 1);
     torrent.set_hash(lt::piece_index_t{0},
         lt::hasher(payload.data(), static_cast<int>(payload.size())).final());
     const auto bytes = torrent.generate_buf();
@@ -107,7 +109,11 @@ void run_tabbed_details_tests() {
     {
         bt::Engine engine([](const std::string&, const nlohmann::json&) {});
         engine.dispatch("engine.initialize", {
-            {"protocolVersion", "1.6"}, {"statePath", path_utf8(state_path)}});
+            {"protocolVersion", "1.9"}, {"statePath", path_utf8(state_path)}});
+        const auto network = engine.dispatch("engine.status", nlohmann::json::object()).at("network");
+        expect(network.at("listening").is_boolean() && network.at("dhtRunning").is_boolean()
+                && network.at("listeners").is_array() && network.at("portMappings").is_array(),
+            "network diagnostics contract is incomplete");
 
         const auto added = engine.dispatch("task.add", {
             {"source", {{"kind", "torrentFile"}, {"path", path_utf8(torrent_path)}}},
@@ -123,6 +129,20 @@ void run_tabbed_details_tests() {
             "1.4 task.details must not carry the file list");
         expect(details.at("peers") == nlohmann::json::array(),
             "1.4 task.details must not carry the peer list");
+        expect(details.at("httpRangeSupported").is_null()
+                && details.at("httpTransferMode") == "unknown"
+                && details.at("httpResponseStatus").is_null(),
+            "BT overview must not invent HTTP capabilities");
+        expect(engine.dispatch("task.trackers", {{"id", task_id}}).at("trackers").is_array(),
+            "task.trackers did not expose a tracker array");
+        const auto tracker_page = engine.dispatch("task.trackers", {{"id", task_id}, {"limit", 1}});
+        expect(tracker_page.at("trackers").size() == 1 && tracker_page.at("nextOffset") == 1
+                && tracker_page.at("totalTrackers").get<int>() >= 2,
+            "task.trackers pagination did not preserve all trackers");
+        expect_error(dispatch_rpc(engine, "task.trackers", {{"id", task_id}, {"limit", 101}}),
+            "INVALID_PAGINATION");
+        expect_error(dispatch_rpc(engine, "task.reannounce", {{"id", task_id}}), "TASK_PAUSED");
+        expect_error(dispatch_rpc(engine, "task.retry", {{"id", task_id}}), "TASK_NOT_FAILED");
 
         const auto all_files = dispatch_rpc(engine, "task.files", {{"id", task_id}});
         const auto& files = all_files.at("result").at("files");

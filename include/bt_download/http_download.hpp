@@ -32,6 +32,9 @@ struct HttpTransferProgress {
     std::uint64_t downloaded_bytes{0};
     std::size_t active_connections{0};
     std::vector<HttpByteRangeProgress> ranges;
+    std::optional<bool> range_supported;
+    std::string mode{"unknown"};
+    long response_status{0};
 };
 
 struct HttpTransferUpdate {
@@ -66,6 +69,7 @@ public:
         std::size_t max_connections,
         const EngineProxyConfig& proxy);
     bool cancel(const std::string& id);
+    void forget_progress(const std::string& id);
     bool contains(const std::string& id) const;
     std::size_t active_count() const noexcept;
     std::optional<HttpTransferProgress> progress(const std::string& id) const;

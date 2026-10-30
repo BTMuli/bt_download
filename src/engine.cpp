@@ -8,6 +8,7 @@
 #include "seeding_policy.hpp"
 #include "system_cost.hpp"
 #include "tracker_config.hpp"
+#include "tracker_peers.hpp"
 
 #include <algorithm>
 #include <array>
@@ -43,6 +44,7 @@ namespace lt = libtorrent;
 namespace {
 
 constexpr auto resume_save_interval = std::chrono::seconds(30);
+constexpr auto download_time_save_interval = std::chrono::seconds(5);
 constexpr auto final_resume_timeout = std::chrono::seconds(10);
 constexpr auto payload_probe_interval = std::chrono::seconds(1);
 constexpr auto system_cost_check_interval = std::chrono::seconds(5);
@@ -189,6 +191,21 @@ std::string endpoint_string(const lt::tcp::endpoint& endpoint) {
     return address + ":" + std::to_string(endpoint.port());
 }
 
+std::string_view listen_socket_name(lt::socket_type_t type) {
+    switch (type) {
+    case lt::socket_type_t::tcp: return "TCP";
+    case lt::socket_type_t::utp: return "UDP";
+    case lt::socket_type_t::tcp_ssl: return "TCP/TLS";
+    case lt::socket_type_t::utp_ssl: return "UDP/TLS";
+    case lt::socket_type_t::socks5: return "SOCKS5";
+    case lt::socket_type_t::socks5_ssl: return "SOCKS5/TLS";
+    case lt::socket_type_t::http: return "HTTP proxy";
+    case lt::socket_type_t::http_ssl: return "HTTPS proxy";
+    case lt::socket_type_t::i2p: return "I2P";
+    }
+    return "unknown";
+}
+
 int priority_value(lt::download_priority_t priority) {
     return static_cast<int>(static_cast<std::uint8_t>(priority));
 }
@@ -232,7 +249,8 @@ lt::settings_pack make_settings(const EngineConfig& config,
     settings.set_int(lt::settings_pack::download_rate_limit, static_cast<int>(config.download_rate_limit));
     settings.set_int(lt::settings_pack::upload_rate_limit, static_cast<int>(config.upload_rate_limit));
     settings.set_str(lt::settings_pack::user_agent, user_agent);
-    const auto alert_mask = lt::alert_category::error | lt::alert_category::storage;
+    const auto alert_mask = lt::alert_category::error | lt::alert_category::storage
+        | lt::alert_category::tracker | lt::alert_category::status | lt::alert_category::port_mapping;
     settings.set_int(lt::settings_pack::alert_mask, static_cast<int>(static_cast<std::uint32_t>(alert_mask)));
     const bool proxy_enabled = proxy.enabled && proxy.peer_proxy.has_value();
     if (proxy_enabled) {
@@ -304,6 +322,8 @@ nlohmann::json Engine::dispatch(const std::string& method, const nlohmann::json&
     if (method == "task.details") return get_task_details(params);
     if (method == "task.files") return get_task_files(params);
     if (method == "task.peers") return get_task_peers(params);
+    if (method == "task.trackers") return get_task_trackers(params);
+    if (method == "task.reannounce") return reannounce_task(params);
     if (method == "task.setFilePriorities") return set_file_priorities(params);
     if (method == "task.pause") return pause_task(params);
     if (method == "task.stop") return pause_task(params, true);
@@ -373,6 +393,8 @@ nlohmann::json Engine::initialize(const nlohmann::json& params) {
         } catch (const std::invalid_argument& exception) {
             handles_.clear();
             peer_identities_.clear();
+            tracker_peers_.clear();
+            download_timers_.clear();
             tasks_.clear();
             session_.reset();
             initialized_ = false;
@@ -384,13 +406,40 @@ nlohmann::json Engine::initialize(const nlohmann::json& params) {
         persist_catalog_locked();
     }
     next_resume_save_ = std::chrono::steady_clock::now() + resume_save_interval;
+    next_download_time_save_ = std::chrono::steady_clock::now() + download_time_save_interval;
     worker_ = std::jthread([this](std::stop_token token) { worker_loop(token); });
     return {{"protocolVersion", BT_DOWNLOAD_PROTOCOL_VERSION}, {"engineVersion", BT_DOWNLOAD_VERSION},
             {"libtorrentVersion", LIBTORRENT_VERSION}, {"restoredTasks", tasks_.size()},
             {"features", nlohmann::json::array({"additionalTrackers", "limitedSeeding",
                 "constrainedUpload", "taskDetails", "tabbedDetails", "httpDownloads",
-                "httpMultiConnection", "systemProxy", "peerIdentity"})},
+                "httpMultiConnection", "systemProxy", "peerIdentity", "networkDiagnostics", "taskTrackers", "trackerPeerLinks"})},
+            {"network", network_status_locked()},
             {"config", config_json(config_)}, {"proxy", proxy_status_json(proxy_)}};
+}
+
+nlohmann::json Engine::network_status_locked() const {
+    const auto settings = session_ ? session_->get_settings() : lt::settings_pack{};
+    nlohmann::json listeners = nlohmann::json::array();
+    for (const auto& item : listen_results_.items()) listeners.push_back(item.value());
+    nlohmann::json mappings = nlohmann::json::array();
+    for (const auto& item : port_mapping_results_.items()) {
+        const auto& value = item.value();
+        const bool enabled = session_ && settings.get_bool(value.at("transport") == "upnp"
+            ? lt::settings_pack::enable_upnp : lt::settings_pack::enable_natpmp);
+        if (enabled) mappings.push_back(value);
+    }
+    int nodes = 0;
+    for (const auto& [endpoint, count] : dht_nodes_) { (void)endpoint; nodes += count; }
+    return {{"listening", session_ && session_->is_listening()},
+        {"listenPort", session_ ? session_->listen_port() : 0},
+        {"dhtEnabled", session_ && settings.get_bool(lt::settings_pack::enable_dht)},
+        {"dhtRunning", session_ && session_->is_dht_running()},
+        {"dhtNodes", session_ && session_->is_dht_running() ? nlohmann::json(nodes) : nlohmann::json()},
+        {"dhtSampled", session_ && session_->is_dht_running() && !dht_nodes_.empty()},
+        {"lsdEnabled", session_ && settings.get_bool(lt::settings_pack::enable_lsd)},
+        {"upnpEnabled", session_ && settings.get_bool(lt::settings_pack::enable_upnp)},
+        {"natPmpEnabled", session_ && settings.get_bool(lt::settings_pack::enable_natpmp)},
+        {"listeners", std::move(listeners)}, {"portMappings", std::move(mappings)}};
 }
 
 nlohmann::json Engine::status() const {
@@ -406,7 +455,8 @@ nlohmann::json Engine::status() const {
             {"uptimeSeconds", uptime}, {"taskCount", tasks_.size()}, {"activeTasks", active},
             {"features", nlohmann::json::array({"additionalTrackers", "limitedSeeding",
                 "constrainedUpload", "taskDetails", "tabbedDetails", "httpDownloads",
-                "httpMultiConnection", "systemProxy", "peerIdentity"})},
+                "httpMultiConnection", "systemProxy", "peerIdentity", "networkDiagnostics", "taskTrackers", "trackerPeerLinks"})},
+            {"network", network_status_locked()},
             {"config", config_json(config_)}, {"proxy", proxy_status_json(proxy_)}};
 }
 
@@ -446,6 +496,9 @@ nlohmann::json Engine::configure_proxy(const nlohmann::json& params) {
         emit_task("event.taskUpdated", task);
     }
     proxy_ = std::move(next);
+    // 旧网络设置下的采样和端口映射不再代表当前状态。
+    dht_nodes_.clear();
+    port_mapping_results_ = nlohmann::json::object();
     session_->pause();
     session_->apply_settings(make_settings(effective_config(), proxy_, user_agent_));
     session_->resume();
@@ -749,7 +802,8 @@ bool Engine::update_http_tasks_locked(bool emit_events) {
         }
 
         const bool state_changed = task.state != previous_state;
-        const bool progress_changed = task.total_bytes != previous_total
+        const bool time_changed = update_download_time_locked(task);
+        const bool progress_changed = time_changed || task.total_bytes != previous_total
             || task.downloaded_bytes != previous_downloaded
             || task.download_rate != previous_rate;
         if (state_changed || progress_changed) {
@@ -868,6 +922,7 @@ nlohmann::json Engine::add_task(const nlohmann::json& params) {
     }
 
     auto identities = track_peer_identities(add);
+    auto tracker_peers = track_tracker_peers(add);
     auto handle = session_->add_torrent(std::move(add), error);
     if (error) fail(-32000, "ENGINE_ADD_FAILED", error_message_utf8(error), true);
     apply_additional_trackers_locked(handle, false);
@@ -884,11 +939,12 @@ nlohmann::json Engine::add_task(const nlohmann::json& params) {
     task.private_torrent = private_torrent;
     handles_.emplace(task.id, handle);
     peer_identities_.emplace(task.id, std::move(identities));
+    tracker_peers_.emplace(task.id, std::move(tracker_peers));
     tasks_.emplace(task.id, task);
     if (kind == "magnet" && start) metadata_started_.emplace(task.id, std::chrono::steady_clock::now());
     persist_catalog_locked();
-    emit_task("event.taskAdded", task);
-    return {{"task", task}};
+    emit_task("event.taskAdded", tasks_.at(task.id));
+    return {{"task", tasks_.at(task.id)}};
 }
 
 nlohmann::json Engine::list_tasks() {
@@ -925,6 +981,11 @@ nlohmann::json Engine::task_overview_locked(const std::string& id) {
             {"contentFiles", 1},
             {"totalPeers", 0},
             {"httpConnections", progress ? progress->active_connections : 0},
+            {"httpRangeSupported", progress && progress->range_supported
+                ? nlohmann::json(*progress->range_supported) : nlohmann::json()},
+            {"httpTransferMode", progress ? progress->mode : "unknown"},
+            {"httpResponseStatus", progress && progress->response_status > 0
+                ? nlohmann::json(progress->response_status) : nlohmann::json()},
         };
     }
     const auto found = handles_.find(id);
@@ -943,10 +1004,14 @@ nlohmann::json Engine::task_overview_locked(const std::string& id) {
         {"contentFiles", 0},
         {"totalPeers", 0},
         {"httpConnections", 0},
+        {"httpRangeSupported", nlohmann::json()},
+        {"httpTransferMode", "unknown"},
+        {"httpResponseStatus", nlohmann::json()},
     };
+    const auto status = handle.status(lt::torrent_handle::query_name | lt::torrent_handle::query_pieces);
+    overview["totalPeers"] = std::max(0, status.num_peers);
     if (!info) return overview;
 
-    const auto status = handle.status(lt::torrent_handle::query_name | lt::torrent_handle::query_pieces);
     overview["pieceLength"] = info->piece_length();
     overview["pieceCount"] = info->num_pieces();
     std::string completed_pieces;
@@ -1045,11 +1110,13 @@ nlohmann::json Engine::task_files_locked(const std::string& id, std::size_t offs
     return result;
 }
 
-nlohmann::json Engine::task_peers_locked(const std::string& id, std::size_t offset, std::size_t limit) {
+nlohmann::json Engine::task_peers_locked(const std::string& id, std::size_t offset, std::size_t limit,
+    const std::string& tracker_url) {
     const auto& task = require_task_locked(id);
     if (task.source_kind == "http") {
         return {
             {"peers", nlohmann::json::array()},
+            {"trackerUrls", nlohmann::json::array()},
             {"peersTruncated", false},
             {"totalPeers", 0},
             {"offset", offset},
@@ -1061,30 +1128,65 @@ nlohmann::json Engine::task_peers_locked(const std::string& id, std::size_t offs
         fail(-32005, "TASK_UNAVAILABLE", "task has no active torrent handle", true);
     }
     const auto& handle = found->second;
-    const auto info = handle.torrent_file();
     nlohmann::json result = {
         {"peers", nlohmann::json::array()},
+        {"trackerUrls", nlohmann::json::array()},
         {"peersTruncated", false},
         {"totalPeers", 0},
         {"offset", offset},
         {"nextOffset", nlohmann::json()},
     };
-    if (!info) return result;
-
     std::vector<lt::peer_info> peers;
     handle.get_peer_info(peers);
+    // 窗口仍是动态快照，但同一批连接按地址稳定排序，减少翻页时的漂移。
+    std::sort(peers.begin(), peers.end(), [](const auto& left, const auto& right) {
+        return endpoint_string(left.ip) < endpoint_string(right.ip);
+    });
+    std::unordered_set<std::string> active_urls;
+    for (const auto& tracker : handle.trackers()) active_urls.insert(tracker.url);
+    std::map<std::string, std::vector<std::string>> associations;
+    const auto now = TrackerPeerStore::Clock::now();
+    auto peer_urls = [&](const lt::peer_info& peer) -> const std::vector<std::string>& {
+        const auto endpoint = endpoint_string(peer.ip);
+        const auto [entry, inserted] = associations.try_emplace(endpoint);
+        if (inserted && peer.connection_type == lt::peer_info::standard_bittorrent) {
+            entry->second = tracker_peers_.at(id)->urls(endpoint, now);
+            std::erase_if(entry->second, [&](const auto& url) { return !active_urls.contains(url); });
+        }
+        return entry->second;
+    };
+    if (!tracker_url.empty()) {
+        std::erase_if(peers, [&](const auto& peer) {
+            const auto& urls = peer_urls(peer);
+            return std::find(urls.begin(), urls.end(), tracker_url) == urls.end();
+        });
+    }
     const auto total_peers = peers.size();
     result["totalPeers"] = total_peers;
     if (offset >= total_peers || limit == 0) return result;
 
     const auto end = std::min(total_peers, offset + limit);
     const auto& identities = peer_identities_.at(id);
+    std::map<std::string, std::size_t> tracker_indices;
     for (std::size_t index = offset; index < end; ++index) {
         const auto& peer = peers[index];
         const bool has_peer_id = peer.connection_type == lt::peer_info::standard_bittorrent
             && !(peer.flags & (lt::peer_info::handshake | lt::peer_info::connecting));
         std::ostringstream peer_id;
         if (has_peer_id) peer_id << peer.pid;
+        nlohmann::json sources = nlohmann::json::array();
+        if (peer.source & lt::peer_info::tracker) sources.push_back("tracker");
+        if (peer.source & lt::peer_info::dht) sources.push_back("dht");
+        if (peer.source & lt::peer_info::pex) sources.push_back("pex");
+        if (peer.source & lt::peer_info::lsd) sources.push_back("lsd");
+        if (peer.source & lt::peer_info::resume_data) sources.push_back("resumeData");
+        if (peer.source & lt::peer_info::incoming) sources.push_back("incoming");
+        nlohmann::json tracker_ids = nlohmann::json::array();
+        for (const auto& url : peer_urls(peer)) {
+            const auto [entry, inserted] = tracker_indices.try_emplace(url, tracker_indices.size());
+            if (inserted) result["trackerUrls"].push_back(url);
+            tracker_ids.push_back(entry->second);
+        }
         result["peers"].push_back({
             {"endpoint", endpoint_string(peer.ip)},
             {"userAgent", identities->user_agent(peer.ip, peer.pid)},
@@ -1093,6 +1195,20 @@ nlohmann::json Engine::task_peers_locked(const std::string& id, std::size_t offs
             {"progress", std::clamp(peer.progress, 0.0F, 1.0F)},
             {"downloadRate", std::max(0, peer.payload_down_speed)},
             {"uploadRate", std::max(0, peer.payload_up_speed)},
+            {"choked", bool(peer.flags & lt::peer_info::choked)},
+            {"interested", bool(peer.flags & lt::peer_info::interesting)},
+            {"remoteChoked", bool(peer.flags & lt::peer_info::remote_choked)},
+            {"remoteInterested", bool(peer.flags & lt::peer_info::remote_interested)},
+            {"connectionState", peer.flags & lt::peer_info::connecting ? "connecting"
+                : peer.flags & lt::peer_info::handshake ? "handshake" : "connected"},
+            {"seed", bool(peer.flags & lt::peer_info::seed)},
+            {"transport", peer.connection_type != lt::peer_info::standard_bittorrent ? "webSeed"
+                : peer.flags & lt::peer_info::utp_socket ? "utp" : "tcp"},
+            {"encryption", peer.flags & lt::peer_info::ssl_socket ? "tls"
+                : peer.flags & lt::peer_info::rc4_encrypted ? "rc4"
+                : peer.flags & lt::peer_info::plaintext_encrypted ? "handshake" : "none"},
+            {"sources", std::move(sources)},
+            {"trackerIndices", std::move(tracker_ids)},
         });
     }
     result["peersTruncated"] = end < total_peers;
@@ -1125,7 +1241,98 @@ nlohmann::json Engine::get_task_peers(const nlohmann::json& params) {
     require_initialized();
     const auto id = params.at("id").get<std::string>();
     const auto [offset, limit] = parse_task_page(params, max_detail_peers);
-    return task_peers_locked(id, offset, limit);
+    const auto tracker_url = params.value("trackerUrl", std::string{});
+    if (tracker_url.size() > 4096) fail(-32602, "INVALID_PARAMS", "trackerUrl is too long");
+    return task_peers_locked(id, offset, limit, tracker_url);
+}
+
+nlohmann::json Engine::get_task_trackers(const nlohmann::json& params) {
+    std::scoped_lock lock(mutex_);
+    require_initialized();
+    const auto id = params.at("id").get<std::string>();
+    const auto& task = require_task_locked(id);
+    const auto [offset, limit] = parse_task_page(params, 100);
+    nlohmann::json result = {{"trackers", nlohmann::json::array()},
+        {"totalTrackers", 0}, {"offset", offset}, {"nextOffset", nullptr}};
+    if (task.source_kind == "http") return result;
+    const auto found = handles_.find(id);
+    if (found == handles_.end() || !found->second.is_valid()) {
+        fail(-32005, "TASK_UNAVAILABLE", "task has no active torrent handle", true);
+    }
+    const auto& handle = found->second;
+    const bool paused = bool(handle.flags() & lt::torrent_flags::paused);
+    const auto hashes = handle.info_hashes();
+    const auto now = lt::clock_type::now();
+    const auto peer_endpoint = params.value("peerEndpoint", std::string{});
+    if (peer_endpoint.size() > 512) fail(-32602, "INVALID_PARAMS", "peerEndpoint is too long");
+    const auto peer_urls = peer_endpoint.empty() ? std::vector<std::string>{}
+        : tracker_peers_.at(id)->urls(peer_endpoint);
+    for (const auto& tracker : handle.trackers()) {
+        if (!peer_endpoint.empty()
+            && std::find(peer_urls.begin(), peer_urls.end(), tracker.url) == peer_urls.end()) continue;
+        if (tracker.endpoints.empty()) {
+            result["trackers"].push_back({{"url", tracker.url}, {"tier", tracker.tier},
+                {"endpoint", ""}, {"protocol", ""}, {"state", paused ? "paused" : "waiting"},
+                {"lastError", ""}, {"message", ""}, {"nextAnnounceSeconds", nullptr},
+                {"peers", nullptr}});
+        }
+        for (const auto& endpoint : tracker.endpoints) {
+            int version = 0;
+            for (const auto& info : endpoint.info_hashes) {
+                ++version;
+                if ((version == 1 && !hashes.has_v1()) || (version == 2 && !hashes.has_v2())) continue;
+                const auto address = endpoint_string(endpoint.local_endpoint);
+                const auto key = tracker.url + "\n" + address + "\n" + std::to_string(version);
+                const auto replies = tracker_reply_peers_.find(id);
+                nlohmann::json peers;
+                if (replies != tracker_reply_peers_.end()) {
+                    const auto reply = replies->second.find(key);
+                    if (reply != replies->second.end()) peers = reply->second;
+                }
+                nlohmann::json next;
+                if (!paused && endpoint.enabled && info.next_announce != (lt::time_point32::min)()) {
+                    const auto due = std::max(info.next_announce, info.min_announce);
+                    next = std::max<std::int64_t>(0,
+                        std::chrono::duration_cast<std::chrono::seconds>(due - now).count());
+                }
+                const auto state = paused ? "paused" : !endpoint.enabled ? "disabled"
+                    : info.updating ? "updating" : info.last_error ? "error"
+                    : info.start_sent ? "working" : "waiting";
+                result["trackers"].push_back({{"url", tracker.url}, {"tier", tracker.tier},
+                    {"endpoint", address}, {"protocol", version == 1 ? "v1" : "v2"},
+                    {"state", state}, {"lastError", info.last_error ? error_message_utf8(info.last_error) : ""},
+                    {"message", info.message}, {"nextAnnounceSeconds", next}, {"peers", peers}});
+            }
+        }
+    }
+    auto& rows = result["trackers"];
+    const auto total = rows.size();
+    result["totalTrackers"] = total;
+    const auto begin = std::min(offset, total);
+    const auto end = begin + std::min(limit, total - begin);
+    nlohmann::json page = nlohmann::json::array();
+    for (auto index = begin; index < end; ++index) page.push_back(std::move(rows[index]));
+    rows = std::move(page);
+    if (end < total) result["nextOffset"] = end;
+    return result;
+}
+
+nlohmann::json Engine::reannounce_task(const nlohmann::json& params) {
+    std::scoped_lock lock(mutex_);
+    require_initialized();
+    const auto id = params.at("id").get<std::string>();
+    const auto& task = require_task_locked(id);
+    if (task.source_kind == "http") fail(-32602, "SOURCE_UNSUPPORTED", "HTTP tasks have no trackers");
+    const auto found = handles_.find(id);
+    if (found == handles_.end() || !found->second.is_valid()) {
+        fail(-32005, "TASK_UNAVAILABLE", "task has no active torrent handle", true);
+    }
+    if (found->second.flags() & lt::torrent_flags::paused) {
+        fail(-32005, "TASK_PAUSED", "resume the task before reannouncing");
+    }
+    // 保留 Tracker 最小汇报间隔，不使用 ignore_min_interval。
+    found->second.force_reannounce();
+    return {{"scheduled", true}};
 }
 
 nlohmann::json Engine::set_file_priorities(const nlohmann::json& params) {
@@ -1312,7 +1519,20 @@ nlohmann::json Engine::resume_task(const nlohmann::json& params) {
     return {{"task", task}};
 }
 
-nlohmann::json Engine::retry_task(const nlohmann::json& params) { return resume_task(params); }
+nlohmann::json Engine::retry_task(const nlohmann::json& params) {
+    {
+        std::scoped_lock lock(mutex_);
+        require_initialized();
+        const auto& task = require_task_locked(params.at("id").get<std::string>());
+        if (task.state != TaskState::error || !task.last_error) {
+            fail(-32005, "TASK_NOT_FAILED", "only failed tasks can be retried");
+        }
+        if (!task.last_error->retryable) {
+            fail(-32005, "TASK_NOT_RETRYABLE", "correct the source or configuration and add the task again");
+        }
+    }
+    return resume_task(params);
+}
 
 void Engine::start_recheck_locked(TaskSnapshot& task, lt::torrent_handle& handle) {
     const bool was_completed = task.state == TaskState::completed;
@@ -1414,6 +1634,10 @@ nlohmann::json Engine::remove_task(const nlohmann::json& params) {
     const auto snapshot = task;
     handles_.erase(id);
     peer_identities_.erase(id);
+    tracker_peers_.erase(id);
+    download_timers_.erase(id);
+    tracker_reply_peers_.erase(id);
+    http_downloads_.forget_progress(id);
     pending_resume_saves_.erase(id);
     deferred_resume_saves_.erase(id);
     pending_task_updates_.erase(id);
@@ -1466,6 +1690,9 @@ void Engine::finalize_locked() {
         auto& task = tasks_.at(id);
         if (task.state != TaskState::completed && task.state != TaskState::stopped) task.state = TaskState::paused;
     }
+    for (auto& [id, task] : tasks_) update_download_time_locked(task);
+    // Save the final per-task timers before waiting for libtorrent resume data.
+    persist_catalog_locked();
     save_final_resume_data_locked();
     persist_catalog_locked();
     pending_resume_saves_.clear();
@@ -1476,21 +1703,24 @@ void Engine::finalize_locked() {
     file_priorities_.clear();
     handles_.clear();
     peer_identities_.clear();
+    tracker_peers_.clear();
+    download_timers_.clear();
     session_.reset();
 }
 
 void Engine::persist_catalog_locked() {
     if (state_path_.empty()) return;
     nlohmann::json task_json = nlohmann::json::array();
-    for (const auto& [id, task] : tasks_) {
+    for (auto& [id, task] : tasks_) {
         (void)id;
+        update_download_time_locked(task);
         nlohmann::json item = task;
         item["source"] = task.source;
         if (task.source_kind == "http") item["fileName"] = http_file_names_.at(id);
         task_json.push_back(std::move(item));
     }
     const nlohmann::json catalog = {
-        {"schemaVersion", 3}, {"config", config_json(config_)}, {"tasks", std::move(task_json)}};
+        {"schemaVersion", 4}, {"config", config_json(config_)}, {"tasks", std::move(task_json)}};
     const auto target = state_path_ / "catalog.json";
     const auto temporary = state_path_ / "catalog.json.tmp";
     {
@@ -1503,6 +1733,7 @@ void Engine::persist_catalog_locked() {
     if (!replace_file(temporary, target)) {
         fail(-32000, "PERSISTENCE_ERROR", "cannot atomically replace task catalog", true);
     }
+    download_time_dirty_ = false;
 }
 
 bool Engine::load_catalog_locked() {
@@ -1512,7 +1743,7 @@ bool Engine::load_catalog_locked() {
         std::ifstream input(catalog_path, std::ios::binary);
         const auto catalog = nlohmann::json::parse(input);
         const int schema_version = catalog.value("schemaVersion", 0);
-        if (schema_version != 1 && schema_version != 2 && schema_version != 3) return false;
+        if (schema_version < 1 || schema_version > 4) return false;
         if (catalog.contains("config")) {
             config_ = apply_config_patch(config_, catalog["config"]);
             if (schema_version == 1) {
@@ -1526,7 +1757,9 @@ bool Engine::load_catalog_locked() {
         }
         for (const auto& item : catalog.value("tasks", nlohmann::json::array())) {
             try {
-                auto task = item.get<TaskSnapshot>();
+                auto migrated = item;
+                if (schema_version < 4) migrated["downloadMilliseconds"] = 0;
+                auto task = migrated.get<TaskSnapshot>();
                 if (schema_version == 1 && task.state == TaskState::completed) {
                     task.seed_stop_reason = SeedStopReason::disabled;
                 }
@@ -1634,12 +1867,14 @@ bool Engine::load_catalog_locked() {
                 add.flags |= lt::torrent_flags::paused;
                 if (!should_resume) add.flags &= ~lt::torrent_flags::auto_managed;
                 auto identities = track_peer_identities(add);
+                auto tracker_peers = track_tracker_peers(add);
                 auto handle = session_->add_torrent(std::move(add), error);
                 if (error) throw std::runtime_error(error_message_utf8(error));
                 apply_additional_trackers_locked(handle, false);
                 if (should_resume) handle.resume();
                 handles_.emplace(task.id, handle);
                 peer_identities_.emplace(task.id, std::move(identities));
+                tracker_peers_.emplace(task.id, std::move(tracker_peers));
                 if (stage_magnet_metadata) {
                     metadata_started_.insert_or_assign(task.id, std::chrono::steady_clock::now());
                 }
@@ -1694,6 +1929,48 @@ void Engine::process_alerts_locked() {
     std::vector<lt::alert*> alerts;
     session_->pop_alerts(&alerts);
     for (const auto* alert : alerts) {
+        if (const auto* reply = lt::alert_cast<lt::tracker_reply_alert>(alert)) {
+            if (const auto id = task_id_for_handle_locked(reply->handle)) {
+                const auto version = reply->version == lt::protocol_version::V1 ? "1" : "2";
+                const auto key = std::string(reply->tracker_url()) + "\n"
+                    + endpoint_string(reply->local_endpoint) + "\n" + version;
+                tracker_reply_peers_[*id][key] = reply->num_peers;
+            }
+        }
+        if (const auto* stats = lt::alert_cast<lt::dht_stats_alert>(alert)) {
+            int nodes = 0;
+            for (const auto& bucket : stats->routing_table) nodes += bucket.num_nodes;
+            const auto endpoint = static_cast<const lt::udp::endpoint&>(stats->local_endpoint);
+            dht_nodes_[endpoint_string(lt::tcp::endpoint(endpoint.address(), endpoint.port()))] = nodes;
+        }
+        if (const auto* listen = lt::alert_cast<lt::listen_succeeded_alert>(alert)) {
+            const auto address = static_cast<const lt::address&>(listen->address).to_string();
+            const auto type = static_cast<int>(listen->socket_type);
+            listen_results_[address + ":" + std::to_string(type)] = {
+                {"address", address}, {"port", listen->port}, {"socketType", listen_socket_name(listen->socket_type)},
+                {"state", "listening"}, {"error", ""}};
+        }
+        if (const auto* listen = lt::alert_cast<lt::listen_failed_alert>(alert)) {
+            const auto address = static_cast<const lt::address&>(listen->address).to_string();
+            const auto type = static_cast<int>(listen->socket_type);
+            listen_results_[address + ":" + std::to_string(type)] = {
+                {"address", address}, {"port", listen->port}, {"socketType", listen_socket_name(listen->socket_type)},
+                {"state", "error"}, {"error", error_message_utf8(listen->error)}};
+        }
+        if (const auto* mapping = lt::alert_cast<lt::portmap_alert>(alert)) {
+            const auto address = static_cast<const lt::address&>(mapping->local_address).to_string();
+            const auto transport = mapping->map_transport == lt::portmap_transport::upnp ? "upnp" : "natPmp";
+            const auto key = address + ":" + transport + ":" + std::to_string(static_cast<int>(mapping->mapping));
+            port_mapping_results_[key] = {{"address", address}, {"transport", transport},
+                {"state", "mapped"}, {"externalPort", mapping->external_port}, {"error", ""}};
+        }
+        if (const auto* mapping = lt::alert_cast<lt::portmap_error_alert>(alert)) {
+            const auto address = static_cast<const lt::address&>(mapping->local_address).to_string();
+            const auto transport = mapping->map_transport == lt::portmap_transport::upnp ? "upnp" : "natPmp";
+            const auto key = address + ":" + transport + ":" + std::to_string(static_cast<int>(mapping->mapping));
+            port_mapping_results_[key] = {{"address", address}, {"transport", transport},
+                {"state", "error"}, {"externalPort", nullptr}, {"error", error_message_utf8(mapping->error)}};
+        }
         if (const auto* saved = lt::alert_cast<lt::save_resume_data_alert>(alert)) {
             const auto id = task_id_for_handle_locked(saved->handle);
             if (!id) continue;
@@ -1885,7 +2162,18 @@ TaskSnapshot& Engine::require_task_locked(const std::string& id) {
     return found->second;
 }
 
-void Engine::emit_task(const std::string& event, const TaskSnapshot& task) {
+bool Engine::update_download_time_locked(TaskSnapshot& task) {
+    const auto elapsed = download_timers_[task.id].sample(
+        task.state == TaskState::downloading && task.download_rate > 0);
+    if (elapsed == 0) return false;
+    const auto available = (std::numeric_limits<std::uint64_t>::max)() - task.download_milliseconds;
+    task.download_milliseconds += std::min(available, elapsed);
+    download_time_dirty_ = true;
+    return true;
+}
+
+void Engine::emit_task(const std::string& event, TaskSnapshot& task) {
+    update_download_time_locked(task);
     pending_task_updates_.erase(task.id);
     event_sink_(event, {{"sequence", ++sequence_}, {"task", task}});
 }
@@ -2014,7 +2302,8 @@ bool Engine::update_snapshots_locked(bool emit_events) {
             task.download_rate = 0;
             task.upload_rate = 0;
         }
-        const bool progress_changed = previous_downloaded != task.downloaded_bytes
+        const bool time_changed = update_download_time_locked(task);
+        const bool progress_changed = time_changed || previous_downloaded != task.downloaded_bytes
             || previous_uploaded != task.uploaded_bytes
             || previous_seeding_seconds != task.seeding_seconds
             || previous_download_rate != task.download_rate || previous_upload_rate != task.upload_rate
@@ -2040,12 +2329,19 @@ void Engine::worker_loop(std::stop_token stop_token) {
             if (initialized_ && session_) {
                 if (std::chrono::steady_clock::now() >= next_system_cost_check_) {
                     refresh_system_cost_locked();
+                    dht_nodes_.clear();
+                    session_->post_dht_stats();
                 }
                 process_alerts_locked();
                 request_periodic_resume_saves_locked();
                 bool catalog_changed = update_snapshots_locked(true);
                 catalog_changed = update_http_tasks_locked(true) || catalog_changed;
                 catalog_changed = schedule_http_tasks_locked() || catalog_changed;
+                const auto now = std::chrono::steady_clock::now();
+                if (now >= next_download_time_save_) {
+                    catalog_changed = catalog_changed || download_time_dirty_;
+                    next_download_time_save_ = now + download_time_save_interval;
+                }
                 if (catalog_changed) persist_catalog_locked();
             }
         } catch (...) {

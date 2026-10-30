@@ -104,7 +104,7 @@ void run_user_agent_tests() {
     {
         bt::Engine engine([](const std::string&, const nlohmann::json&) {});
         const auto result = engine.dispatch("engine.initialize", {
-            {"protocolVersion", "1.6"},
+            {"protocolVersion", "1.9"},
             {"statePath", path_utf8(state_path / "with-user-agent")},
             {"userAgent", "BangumiToday/0.8.0"}});
         expect(result.contains("protocolVersion"),
@@ -113,7 +113,7 @@ void run_user_agent_tests() {
     {
         bt::Engine engine([](const std::string&, const nlohmann::json&) {});
         expect(initialize_rejected(engine, {
-            {"protocolVersion", "1.6"},
+            {"protocolVersion", "1.9"},
             {"statePath", path_utf8(state_path / "non-string-user-agent")},
             {"userAgent", 42}}, "userAgent must be a string"),
             "non-string userAgent was accepted");
@@ -121,7 +121,7 @@ void run_user_agent_tests() {
     {
         bt::Engine engine([](const std::string&, const nlohmann::json&) {});
         expect(initialize_rejected(engine, {
-            {"protocolVersion", "1.6"},
+            {"protocolVersion", "1.9"},
             {"statePath", path_utf8(state_path / "empty-user-agent")},
             {"userAgent", ""}}, "between 1 and 255"),
             "empty userAgent was accepted");
@@ -130,7 +130,7 @@ void run_user_agent_tests() {
         const std::string overlong(256, 'x');
         bt::Engine engine([](const std::string&, const nlohmann::json&) {});
         expect(initialize_rejected(engine, {
-            {"protocolVersion", "1.6"},
+            {"protocolVersion", "1.9"},
             {"statePath", path_utf8(state_path / "overlong-user-agent")},
             {"userAgent", overlong}}, "between 1 and 255"),
             "overlong userAgent was accepted");
@@ -138,7 +138,7 @@ void run_user_agent_tests() {
     {
         bt::Engine engine([](const std::string&, const nlohmann::json&) {});
         const auto result = engine.dispatch("engine.initialize", {
-            {"protocolVersion", "1.6"},
+            {"protocolVersion", "1.9"},
             {"statePath", path_utf8(state_path / "default-user-agent")}});
         expect(result.contains("protocolVersion"),
             "initialize without a userAgent did not complete");

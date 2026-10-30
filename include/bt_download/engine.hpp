@@ -1,6 +1,7 @@
 #pragma once
 
 #include "bt_download/config.hpp"
+#include "bt_download/download_timer.hpp"
 #include "bt_download/http_download.hpp"
 #include "bt_download/proxy_config.hpp"
 #include "bt_download/task.hpp"
@@ -23,6 +24,7 @@
 namespace bt {
 
 class PeerIdentityStore;
+class TrackerPeerStore;
 
 class Engine {
 public:
@@ -48,6 +50,9 @@ private:
     nlohmann::json get_task_details(const nlohmann::json& params);
     nlohmann::json get_task_files(const nlohmann::json& params);
     nlohmann::json get_task_peers(const nlohmann::json& params);
+    nlohmann::json get_task_trackers(const nlohmann::json& params);
+    nlohmann::json reannounce_task(const nlohmann::json& params);
+    nlohmann::json network_status_locked() const;
     nlohmann::json set_file_priorities(const nlohmann::json& params);
     nlohmann::json pause_task(const nlohmann::json& params, bool stop = false);
     nlohmann::json resume_task(const nlohmann::json& params);
@@ -59,7 +64,8 @@ private:
     void require_initialized() const;
     nlohmann::json task_overview_locked(const std::string& id);
     nlohmann::json task_files_locked(const std::string& id, std::size_t offset, std::size_t limit);
-    nlohmann::json task_peers_locked(const std::string& id, std::size_t offset, std::size_t limit);
+    nlohmann::json task_peers_locked(const std::string& id, std::size_t offset, std::size_t limit,
+        const std::string& tracker_url = {});
     void finalize_locked();
     void persist_catalog_locked();
     bool load_catalog_locked();
@@ -91,7 +97,8 @@ private:
     void start_recheck_locked(TaskSnapshot& task, libtorrent::torrent_handle& handle);
     std::optional<std::string> task_id_for_handle_locked(const libtorrent::torrent_handle& handle) const;
     TaskSnapshot& require_task_locked(const std::string& id);
-    void emit_task(const std::string& event, const TaskSnapshot& task);
+    void emit_task(const std::string& event, TaskSnapshot& task);
+    bool update_download_time_locked(TaskSnapshot& task);
     bool update_snapshots_locked(bool emit_events);
     void worker_loop(std::stop_token stop_token);
     std::string new_task_id() const;
@@ -104,6 +111,12 @@ private:
     std::unordered_map<std::string, std::string> http_file_names_;
     std::unordered_map<std::string, libtorrent::torrent_handle> handles_;
     std::unordered_map<std::string, std::shared_ptr<PeerIdentityStore>> peer_identities_;
+    std::unordered_map<std::string, std::shared_ptr<TrackerPeerStore>> tracker_peers_;
+    std::unordered_map<std::string, DownloadTimer> download_timers_;
+    std::unordered_map<std::string, std::unordered_map<std::string, int>> tracker_reply_peers_;
+    nlohmann::json listen_results_ = nlohmann::json::object();
+    nlohmann::json port_mapping_results_ = nlohmann::json::object();
+    std::unordered_map<std::string, int> dht_nodes_;
     std::unordered_map<std::string, std::vector<libtorrent::download_priority_t>> file_priorities_;
     std::unordered_set<std::string> pending_resume_saves_;
     std::unordered_set<std::string> deferred_resume_saves_;
@@ -117,12 +130,14 @@ private:
     std::string user_agent_;
     std::chrono::steady_clock::time_point started_at_;
     std::chrono::steady_clock::time_point next_resume_save_;
+    std::chrono::steady_clock::time_point next_download_time_save_;
     std::chrono::steady_clock::time_point next_system_cost_check_;
     std::uint64_t sequence_{0};
     std::jthread worker_;
     bool initialized_{false};
     bool shutdown_requested_{false};
     bool constrained_mode_{false};
+    bool download_time_dirty_{false};
 };
 
 } // namespace bt

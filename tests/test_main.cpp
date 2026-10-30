@@ -13,6 +13,8 @@ void run_file_priority_tests();
 void run_http_download_tests();
 void run_tabbed_details_tests();
 void run_user_agent_tests();
+void run_tracker_peers_tests();
+void run_download_timer_tests();
 
 int main() {
     try {
@@ -28,6 +30,8 @@ int main() {
         run_http_download_tests();
         run_tabbed_details_tests();
         run_user_agent_tests();
+        run_tracker_peers_tests();
+        run_download_timer_tests();
         std::cout << "All tests passed\n";
         return 0;
     } catch (const std::exception& exception) {

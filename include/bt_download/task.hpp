@@ -49,6 +49,7 @@ struct TaskSnapshot {
     std::uint64_t uploaded_bytes{0};
     double share_ratio{0.0};
     std::uint64_t seeding_seconds{0};
+    std::uint64_t download_milliseconds{0};
     double seed_ratio_limit{2.0};
     int seed_time_limit_minutes{60};
     std::optional<SeedStopReason> seed_stop_reason;
