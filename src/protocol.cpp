@@ -83,7 +83,8 @@ void ProtocolServer::process_line(const std::string& line) {
 
 void ProtocolServer::write(const nlohmann::json& message) {
     std::scoped_lock lock(write_mutex_);
-    output_ << message.dump() << '\n';
+    // 系统错误在来源处转换为 UTF-8；远端非法文本仍不能破坏整帧响应或事件。
+    output_ << message.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace) << '\n';
     output_.flush();
 }
 

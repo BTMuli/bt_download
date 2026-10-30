@@ -1,5 +1,7 @@
 #include "error_mapping.hpp"
 
+#include "error_message.hpp"
+
 #include <initializer_list>
 #include <string>
 #include <utility>
@@ -88,7 +90,7 @@ bool is_network_error(const lt::error_code& error) {
 }
 
 TaskError mapped(std::string code, const lt::error_code& error, bool retryable) {
-    return {std::move(code), error.message(), retryable};
+    return {std::move(code), error_message_utf8(error), retryable};
 }
 
 } // namespace

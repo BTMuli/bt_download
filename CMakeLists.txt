@@ -38,6 +38,7 @@ add_library(bt_download_core
     src/config.cpp
     src/engine.cpp
     src/error_mapping.cpp
+    src/error_message.cpp
     src/http_download.cpp
     src/path_safety.cpp
     src/peer_identity.cpp

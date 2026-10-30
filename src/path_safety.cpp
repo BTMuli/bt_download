@@ -1,5 +1,7 @@
 #include "bt_download/path_safety.hpp"
 
+#include "error_message.hpp"
+
 #include <algorithm>
 #include <array>
 #include <cerrno>
@@ -74,7 +76,7 @@ PathValidation validate_save_path(const std::filesystem::path& path) {
     }
     std::error_code error;
     const auto normalized = normalize_absolute(path, error);
-    if (error) return {false, {}, "SAVE_PATH_UNAVAILABLE", "savePath cannot be normalized: " + error.message()};
+    if (error) return {false, {}, "SAVE_PATH_UNAVAILABLE", "savePath cannot be normalized: " + error_message_utf8(error)};
     if (!std::filesystem::exists(normalized, error) || !std::filesystem::is_directory(normalized, error)) {
         return {false, normalized, "SAVE_PATH_UNAVAILABLE", "savePath must be an existing directory"};
     }

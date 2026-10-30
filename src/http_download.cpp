@@ -1,5 +1,7 @@
 #include "bt_download/http_download.hpp"
 
+#include "error_message.hpp"
+
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -690,7 +692,7 @@ struct HttpDownloadManager::Impl {
         if (error) {
             request.callback_failure = HttpTransferFailure{
                 "SAVE_PATH_UNAVAILABLE",
-                "cannot query savePath free space: " + error.message(), true, false};
+                "cannot query savePath free space: " + error_message_utf8(error), true, false};
             return 1;
         }
         const auto remaining = transfer.total_bytes > request.start
@@ -932,7 +934,7 @@ struct HttpDownloadManager::Impl {
                 transfer.partial_path.parent_path(), error);
             if (error) {
                 return HttpTransferFailure{"SAVE_PATH_UNAVAILABLE",
-                    "cannot query savePath free space: " + error.message(), true, false};
+                    "cannot query savePath free space: " + error_message_utf8(error), true, false};
             }
             if (transfer.total_bytes > space.available) {
                 return HttpTransferFailure{
@@ -942,7 +944,7 @@ struct HttpDownloadManager::Impl {
                 transfer.partial_path, transfer.total_bytes, error);
             if (error) {
                 return HttpTransferFailure{"STORAGE_ERROR",
-                    "cannot allocate HTTP range file: " + error.message(), true, false};
+                    "cannot allocate HTTP range file: " + error_message_utf8(error), true, false};
             }
         }
 
@@ -1251,7 +1253,7 @@ std::vector<HttpTransferUpdate> HttpDownloadManager::poll(std::uint64_t total_ra
             remove_http_transfer_state(transfer->partial_path, error);
             if (error) {
                 transfer->failure = HttpTransferFailure{"STORAGE_ERROR",
-                    "cannot reset HTTP range state: " + error.message(), true, false};
+                    "cannot reset HTTP range state: " + error_message_utf8(error), true, false};
             } else {
                 impl_->apply_resolved_file_name(*transfer);
                 if (const auto failure = impl_->add_sequential(*transfer, 0)) {

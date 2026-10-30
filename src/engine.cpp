@@ -3,6 +3,7 @@
 #include "bt_download/path_safety.hpp"
 #include "bt_download/protocol.hpp"
 #include "error_mapping.hpp"
+#include "error_message.hpp"
 #include "peer_identity.hpp"
 #include "seeding_policy.hpp"
 #include "system_cost.hpp"
@@ -344,7 +345,7 @@ nlohmann::json Engine::initialize(const nlohmann::json& params) {
     if (!state_path_.is_absolute()) fail(-32602, "STATE_PATH_INVALID", "statePath must be absolute");
     std::error_code error;
     std::filesystem::create_directories(state_path_, error);
-    if (error) fail(-32000, "STATE_PATH_UNAVAILABLE", "cannot create statePath: " + error.message());
+    if (error) fail(-32000, "STATE_PATH_UNAVAILABLE", "cannot create statePath: " + error_message_utf8(error));
 
     const bool has_initial_config = params.contains("config");
     if (has_initial_config) {
@@ -649,7 +650,7 @@ bool Engine::schedule_http_tasks_locked() {
                 "TARGET_FILE_EXISTS", "HTTP target file already exists", false, false};
         } else if (target_error) {
             failure = HttpTransferFailure{"SAVE_PATH_UNAVAILABLE",
-                "cannot inspect HTTP target path: " + target_error.message(), true, false};
+                "cannot inspect HTTP target path: " + error_message_utf8(target_error), true, false};
         } else {
             failure = http_downloads_.start(
                 id, task.source, http_partial_path_locked(id), user_agent_,
@@ -700,14 +701,14 @@ bool Engine::update_http_tasks_locked(bool emit_events) {
                     task.state = TaskState::error;
                     task.download_rate = 0;
                     task.last_error = TaskError{
-                        "STORAGE_ERROR", "cannot read completed HTTP file size: " + error.message(), true};
+                        "STORAGE_ERROR", "cannot read completed HTTP file size: " + error_message_utf8(error), true};
                 } else {
                     std::filesystem::rename(partial, target, error);
                     if (error) {
                         task.state = TaskState::error;
                         task.download_rate = 0;
                         task.last_error = TaskError{
-                            "STORAGE_ERROR", "cannot finalize HTTP file: " + error.message(), true};
+                            "STORAGE_ERROR", "cannot finalize HTTP file: " + error_message_utf8(error), true};
                     } else {
                         task.total_bytes = static_cast<std::uint64_t>(size);
                         task.downloaded_bytes = task.total_bytes;
@@ -731,7 +732,7 @@ bool Engine::update_http_tasks_locked(bool emit_events) {
                 if (error) {
                     task.state = TaskState::error;
                     task.last_error = TaskError{
-                        "STORAGE_ERROR", "cannot reset HTTP partial file: " + error.message(), true};
+                        "STORAGE_ERROR", "cannot reset HTTP partial file: " + error_message_utf8(error), true};
                 } else {
                     task.state = TaskState::queued;
                     task.total_bytes = 0;
@@ -826,7 +827,7 @@ nlohmann::json Engine::add_task(const nlohmann::json& params) {
             fail(-32010, "SOURCE_INVALID", "torrent file must be an existing absolute path");
         }
         auto info = std::make_shared<lt::torrent_info>(source, error);
-        if (error) fail(-32010, "SOURCE_INVALID", "invalid torrent metadata: " + error.message());
+        if (error) fail(-32010, "SOURCE_INVALID", "invalid torrent metadata: " + error_message_utf8(error));
         for (lt::file_index_t index{0}; index < info->files().end_file(); ++index) {
             if (!is_safe_relative_torrent_path(path_from_utf8(info->files().file_path(index)))) {
                 fail(-32010, "UNSAFE_TORRENT_PATH", "torrent contains an unsafe file path");
@@ -868,7 +869,7 @@ nlohmann::json Engine::add_task(const nlohmann::json& params) {
 
     auto identities = track_peer_identities(add);
     auto handle = session_->add_torrent(std::move(add), error);
-    if (error) fail(-32000, "ENGINE_ADD_FAILED", error.message(), true);
+    if (error) fail(-32000, "ENGINE_ADD_FAILED", error_message_utf8(error), true);
     apply_additional_trackers_locked(handle, false);
     if (start) handle.resume();
     TaskSnapshot task;
@@ -1385,19 +1386,19 @@ nlohmann::json Engine::remove_task(const nlohmann::json& params) {
                     task.state = TaskState::error;
                     task.download_rate = 0;
                     task.last_error = TaskError{
-                        "STORAGE_ERROR", "cannot delete HTTP task data: " + error.message(), true};
+                        "STORAGE_ERROR", "cannot delete HTTP task data: " + error_message_utf8(error), true};
                     persist_catalog_locked();
                     emit_task("event.taskUpdated", task);
                     apply_shared_download_budget_locked();
                     fail(-32000, "STORAGE_ERROR",
-                        "cannot delete HTTP task data: " + error.message(), true);
+                        "cannot delete HTTP task data: " + error_message_utf8(error), true);
                 }
             }
             std::error_code state_error;
             remove_http_transfer_state(partial, state_error);
             if (state_error) {
                 fail(-32000, "STORAGE_ERROR",
-                    "cannot delete HTTP range state: " + state_error.message(), true);
+                    "cannot delete HTTP range state: " + error_message_utf8(state_error), true);
             }
         }
     } else {
@@ -1495,7 +1496,7 @@ void Engine::persist_catalog_locked() {
     {
         std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
         if (!output) fail(-32000, "PERSISTENCE_ERROR", "cannot write task catalog", true);
-        output << catalog.dump(2);
+        output << catalog.dump(2, ' ', false, nlohmann::json::error_handler_t::replace);
         output.flush();
         if (!output) fail(-32000, "PERSISTENCE_ERROR", "cannot flush task catalog", true);
     }
@@ -1560,10 +1561,10 @@ bool Engine::load_catalog_locked() {
                     partial += path_from_utf8("." + task.id + ".part");
                     std::error_code error;
                     const bool target_is_regular = std::filesystem::is_regular_file(target, error);
-                    if (error) throw std::runtime_error(error.message());
+                    if (error) throw std::runtime_error(error_message_utf8(error));
                     if (target_is_regular && task.state == TaskState::completed) {
                         const auto size = std::filesystem::file_size(target, error);
-                        if (error) throw std::runtime_error(error.message());
+                        if (error) throw std::runtime_error(error_message_utf8(error));
                         task.total_bytes = static_cast<std::uint64_t>(size);
                         task.downloaded_bytes = task.total_bytes;
                         task.verified_bytes = task.total_bytes;
@@ -1571,13 +1572,13 @@ bool Engine::load_catalog_locked() {
                         task.state = TaskState::completed;
                         task.last_error.reset();
                     } else if (std::filesystem::exists(target, error)) {
-                        if (error) throw std::runtime_error(error.message());
+                        if (error) throw std::runtime_error(error_message_utf8(error));
                         task.download_rate = 0;
                         task.state = TaskState::error;
                         task.last_error = TaskError{
                             "TARGET_FILE_EXISTS", "HTTP target file already exists", false};
                     } else {
-                        if (error) throw std::runtime_error(error.message());
+                        if (error) throw std::runtime_error(error_message_utf8(error));
                         error.clear();
                         if (const auto progress = read_http_transfer_progress(partial)) {
                             task.total_bytes = progress->total_bytes;
@@ -1615,7 +1616,7 @@ bool Engine::load_catalog_locked() {
                         add = lt::parse_magnet_uri(task.source, error);
                     }
                 }
-                if (error) throw std::runtime_error(error.message());
+                if (error) throw std::runtime_error(error_message_utf8(error));
                 add.save_path = path_utf8(task.save_path);
                 add.max_connections = config_.connections_per_task;
                 const bool stage_magnet_metadata = task.source_kind == "magnet"
@@ -1634,7 +1635,7 @@ bool Engine::load_catalog_locked() {
                 if (!should_resume) add.flags &= ~lt::torrent_flags::auto_managed;
                 auto identities = track_peer_identities(add);
                 auto handle = session_->add_torrent(std::move(add), error);
-                if (error) throw std::runtime_error(error.message());
+                if (error) throw std::runtime_error(error_message_utf8(error));
                 apply_additional_trackers_locked(handle, false);
                 if (should_resume) handle.resume();
                 handles_.emplace(task.id, handle);
@@ -1719,7 +1720,7 @@ void Engine::process_alerts_locked() {
             pending_resume_saves_.erase(*id);
             if (failed->error != lt::errors::make_error_code(lt::errors::resume_data_not_modified)) {
                 if (const auto task = tasks_.find(*id); task != tasks_.end()) {
-                    task->second.last_error = TaskError{"RESUME_SAVE_FAILED", failed->error.message(), true};
+                    task->second.last_error = TaskError{"RESUME_SAVE_FAILED", error_message_utf8(failed->error), true};
                     emit_task("event.taskUpdated", task->second);
                 }
             }
@@ -1798,7 +1799,7 @@ bool Engine::validate_magnet_metadata_locked(const std::string& id,
     std::error_code error;
     const auto space = std::filesystem::space(save_validation.normalized, error);
     if (error) {
-        fail_task_locked(id, "SAVE_PATH_UNAVAILABLE", "cannot query savePath free space: " + error.message(), true);
+        fail_task_locked(id, "SAVE_PATH_UNAVAILABLE", "cannot query savePath free space: " + error_message_utf8(error), true);
         return false;
     }
     const auto required = static_cast<std::uint64_t>(std::max<std::int64_t>(0, info->total_size()));
@@ -1835,7 +1836,7 @@ bool Engine::load_resume_data_locked(const TaskSnapshot& task, lt::add_torrent_p
         if (!input) throw std::runtime_error("cannot read resume data");
         lt::error_code error;
         auto restored = lt::read_resume_data(lt::span<char const>(bytes.data(), bytes.size()), error);
-        if (error) throw std::runtime_error(error.message());
+        if (error) throw std::runtime_error(error_message_utf8(error));
         const auto restored_hash = hash_string(restored.info_hashes);
         if (!task.info_hash.empty() && restored_hash != task.info_hash) {
             throw std::runtime_error("resume data info-hash does not match the task catalog");
@@ -1864,7 +1865,7 @@ void Engine::write_resume_data_locked(const std::string& id, const lt::add_torre
     const auto directory = state_path_ / "resume";
     std::error_code error;
     std::filesystem::create_directories(directory, error);
-    if (error) throw std::runtime_error("cannot create resume directory: " + error.message());
+    if (error) throw std::runtime_error("cannot create resume directory: " + error_message_utf8(error));
     const auto bytes = lt::write_resume_data_buf(add);
     const auto target = directory / (id + ".fastresume");
     const auto temporary = directory / (id + ".fastresume.tmp");

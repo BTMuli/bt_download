@@ -2,6 +2,10 @@
 
 协议版本：`1.6`。传输为继承的 stdin/stdout 管道，编码为 UTF-8，每个 JSON-RPC 2.0 对象独占一行。单帧最大 1 MiB。客户端必须同时持续读取 stdout 和 stderr；stdout 不包含日志。
 
+Windows 系统错误先从 Unicode 消息转换为 UTF-8，保留本地化内容。远端或未知来源的显示
+文本仍可能含非法 UTF-8 字节，输出 JSON 和持久化目录时将这些字节替换为 U+FFFD，
+保留合法 UTF-8、有效条目和业务字段，避免整帧失败并误报 `INVALID_PARAMS`。
+
 客户端与引擎始终同版本发布，`engine.initialize` 的 `protocolVersion` 必须与引擎协议版本严格一致（`1.6`），不一致返回 `PROTOCOL_MISMATCH`；不再保留旧协议协商或回退路径。
 
 下载详情按 Tab 拆分：`task.details` 只返回概览（任务、分片状态和文件/Peer 总数），Peer 与文件列表通过 `task.files` / `task.peers` 按需分页拉取。
