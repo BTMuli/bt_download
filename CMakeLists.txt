@@ -40,6 +40,7 @@ add_library(bt_download_core
     src/error_mapping.cpp
     src/http_download.cpp
     src/path_safety.cpp
+    src/peer_identity.cpp
     src/proxy_config.cpp
     src/protocol.cpp
     src/seeding_policy.cpp
@@ -72,11 +73,11 @@ if(WIN32)
 endif()
 target_compile_definitions(bt_download_core PUBLIC
     BT_DOWNLOAD_VERSION="${PROJECT_VERSION}"
-    BT_DOWNLOAD_PROTOCOL_VERSION="1.5"
+    BT_DOWNLOAD_PROTOCOL_VERSION="1.6"
     _WIN32_WINNT=0x0A00
 )
 if(MSVC)
-    target_compile_options(bt_download_core PRIVATE /W4 /permissive- /utf-8 /EHsc)
+    target_compile_options(bt_download_core PRIVATE /W4 /permissive- /utf-8 /EHsc /Zc:__cplusplus)
 else()
     target_compile_options(bt_download_core PRIVATE -Wall -Wextra -Wpedantic)
 endif()

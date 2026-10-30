@@ -1,8 +1,8 @@
 # bt_download 本地调用契约
 
-协议版本：`1.5`。传输为继承的 stdin/stdout 管道，编码为 UTF-8，每个 JSON-RPC 2.0 对象独占一行。单帧最大 1 MiB。客户端必须同时持续读取 stdout 和 stderr；stdout 不包含日志。
+协议版本：`1.6`。传输为继承的 stdin/stdout 管道，编码为 UTF-8，每个 JSON-RPC 2.0 对象独占一行。单帧最大 1 MiB。客户端必须同时持续读取 stdout 和 stderr；stdout 不包含日志。
 
-客户端与引擎始终同版本发布，`engine.initialize` 的 `protocolVersion` 必须与引擎协议版本严格一致（`1.5`），不一致返回 `PROTOCOL_MISMATCH`；不再保留旧协议协商或回退路径。
+客户端与引擎始终同版本发布，`engine.initialize` 的 `protocolVersion` 必须与引擎协议版本严格一致（`1.6`），不一致返回 `PROTOCOL_MISMATCH`；不再保留旧协议协商或回退路径。
 
 下载详情按 Tab 拆分：`task.details` 只返回概览（任务、分片状态和文件/Peer 总数），Peer 与文件列表通过 `task.files` / `task.peers` 按需分页拉取。
 
@@ -214,6 +214,27 @@ Tracker 与做种配置示例：
 - 两个列表均为当前时刻的快照，Peer 列表分页在连接变化时可能移动窗口，客户端应仅用于展示；
 
 Tracker 列表源、自动更新时间和最后同步错误由 BangumiToday 管理，不通过本地引擎协议传输。引擎未收到 `seedingEnabled` 时使用安全默认值 `false`；BangumiToday 客户端负责在新安装且用户已确认提示后显式传入产品默认值 `true`、`2.0` 和 `60`。
+
+### Peer 客户端身份
+
+`task.peers` 的每个条目包含 `endpoint`、`userAgent`、`peerId`、`peerIdClient`、
+`progress`、`downloadRate` 和 `uploadRate`。身份字段按协议必传，不再返回混合来源的
+`client` 字段：
+
+- `userAgent`：独立捕获的 BEP 10 扩展握手 `v` 字段。未收到非空声明时为空字符串，
+  不以 Peer ID 识别结果补齐；它不是对端向网站或 Tracker 发送的 HTTP UA。
+- `peerId`：BT 基础握手中 20 字节 Peer ID 的 40 位小写十六进制编码，保留原始字节；
+  尚未获得 Peer ID 时为空字符串。
+- `peerIdClient`：仅通过 Peer ID 编码约定识别的客户端名称与版本；尚未获得 Peer ID
+  时为空字符串，未识别格式为 `unknown`。支持 BEP 20 中常见客户端代码，以及 aria2
+  的 `A2-MAJOR-MINOR-PATCH-` 格式。识别结果不等同于对端真实软件身份。
+
+```json
+{"endpoint":"127.0.0.1:6881","userAgent":"BangumiToday/0.8.0","peerId":"2d4c54323043302d303132333435363738396162","peerIdClient":"libtorrent 2.0.12","progress":0.5,"downloadRate":1024,"uploadRate":0}
+```
+
+扩展握手观察器随新建及恢复的 BT 任务注册，只记录声明，不修改 Peer ID、扩展协商或
+传输行为。声明随连接销毁，重连时重新收集，Web Seed 不会被当作 BT 客户端声明。
 
 ## 错误
 

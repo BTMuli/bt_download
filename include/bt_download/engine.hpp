@@ -22,6 +22,8 @@
 
 namespace bt {
 
+class PeerIdentityStore;
+
 class Engine {
 public:
     using EventSink = std::function<void(const std::string&, const nlohmann::json&)>;
@@ -101,6 +103,7 @@ private:
     std::unordered_map<std::string, TaskSnapshot> tasks_;
     std::unordered_map<std::string, std::string> http_file_names_;
     std::unordered_map<std::string, libtorrent::torrent_handle> handles_;
+    std::unordered_map<std::string, std::shared_ptr<PeerIdentityStore>> peer_identities_;
     std::unordered_map<std::string, std::vector<libtorrent::download_priority_t>> file_priorities_;
     std::unordered_set<std::string> pending_resume_saves_;
     std::unordered_set<std::string> deferred_resume_saves_;

@@ -3,6 +3,7 @@
 #include "bt_download/path_safety.hpp"
 #include "bt_download/protocol.hpp"
 #include "error_mapping.hpp"
+#include "peer_identity.hpp"
 #include "seeding_policy.hpp"
 #include "system_cost.hpp"
 #include "tracker_config.hpp"
@@ -370,6 +371,7 @@ nlohmann::json Engine::initialize(const nlohmann::json& params) {
             config_ = apply_config_patch(config_, params["config"]);
         } catch (const std::invalid_argument& exception) {
             handles_.clear();
+            peer_identities_.clear();
             tasks_.clear();
             session_.reset();
             initialized_ = false;
@@ -386,7 +388,7 @@ nlohmann::json Engine::initialize(const nlohmann::json& params) {
             {"libtorrentVersion", LIBTORRENT_VERSION}, {"restoredTasks", tasks_.size()},
             {"features", nlohmann::json::array({"additionalTrackers", "limitedSeeding",
                 "constrainedUpload", "taskDetails", "tabbedDetails", "httpDownloads",
-                "httpMultiConnection", "systemProxy"})},
+                "httpMultiConnection", "systemProxy", "peerIdentity"})},
             {"config", config_json(config_)}, {"proxy", proxy_status_json(proxy_)}};
 }
 
@@ -403,7 +405,7 @@ nlohmann::json Engine::status() const {
             {"uptimeSeconds", uptime}, {"taskCount", tasks_.size()}, {"activeTasks", active},
             {"features", nlohmann::json::array({"additionalTrackers", "limitedSeeding",
                 "constrainedUpload", "taskDetails", "tabbedDetails", "httpDownloads",
-                "httpMultiConnection", "systemProxy"})},
+                "httpMultiConnection", "systemProxy", "peerIdentity"})},
             {"config", config_json(config_)}, {"proxy", proxy_status_json(proxy_)}};
 }
 
@@ -864,6 +866,7 @@ nlohmann::json Engine::add_task(const nlohmann::json& params) {
         error.clear();
     }
 
+    auto identities = track_peer_identities(add);
     auto handle = session_->add_torrent(std::move(add), error);
     if (error) fail(-32000, "ENGINE_ADD_FAILED", error.message(), true);
     apply_additional_trackers_locked(handle, false);
@@ -879,6 +882,7 @@ nlohmann::json Engine::add_task(const nlohmann::json& params) {
     task.info_hash = info_hash;
     task.private_torrent = private_torrent;
     handles_.emplace(task.id, handle);
+    peer_identities_.emplace(task.id, std::move(identities));
     tasks_.emplace(task.id, task);
     if (kind == "magnet" && start) metadata_started_.emplace(task.id, std::chrono::steady_clock::now());
     persist_catalog_locked();
@@ -1073,11 +1077,18 @@ nlohmann::json Engine::task_peers_locked(const std::string& id, std::size_t offs
     if (offset >= total_peers || limit == 0) return result;
 
     const auto end = std::min(total_peers, offset + limit);
+    const auto& identities = peer_identities_.at(id);
     for (std::size_t index = offset; index < end; ++index) {
         const auto& peer = peers[index];
+        const bool has_peer_id = peer.connection_type == lt::peer_info::standard_bittorrent
+            && !(peer.flags & (lt::peer_info::handshake | lt::peer_info::connecting));
+        std::ostringstream peer_id;
+        if (has_peer_id) peer_id << peer.pid;
         result["peers"].push_back({
             {"endpoint", endpoint_string(peer.ip)},
-            {"client", peer.client.empty() ? "unknown" : peer.client},
+            {"userAgent", identities->user_agent(peer.ip, peer.pid)},
+            {"peerId", peer_id.str()},
+            {"peerIdClient", has_peer_id ? identify_peer_client(peer.pid) : std::string{}},
             {"progress", std::clamp(peer.progress, 0.0F, 1.0F)},
             {"downloadRate", std::max(0, peer.payload_down_speed)},
             {"uploadRate", std::max(0, peer.payload_up_speed)},
@@ -1401,6 +1412,7 @@ nlohmann::json Engine::remove_task(const nlohmann::json& params) {
     }
     const auto snapshot = task;
     handles_.erase(id);
+    peer_identities_.erase(id);
     pending_resume_saves_.erase(id);
     deferred_resume_saves_.erase(id);
     pending_task_updates_.erase(id);
@@ -1462,6 +1474,7 @@ void Engine::finalize_locked() {
     next_payload_probe_.clear();
     file_priorities_.clear();
     handles_.clear();
+    peer_identities_.clear();
     session_.reset();
 }
 
@@ -1619,11 +1632,13 @@ bool Engine::load_catalog_locked() {
                     && task.state != TaskState::completed && task.state != TaskState::error;
                 add.flags |= lt::torrent_flags::paused;
                 if (!should_resume) add.flags &= ~lt::torrent_flags::auto_managed;
+                auto identities = track_peer_identities(add);
                 auto handle = session_->add_torrent(std::move(add), error);
                 if (error) throw std::runtime_error(error.message());
                 apply_additional_trackers_locked(handle, false);
                 if (should_resume) handle.resume();
                 handles_.emplace(task.id, handle);
+                peer_identities_.emplace(task.id, std::move(identities));
                 if (stage_magnet_metadata) {
                     metadata_started_.insert_or_assign(task.id, std::chrono::steady_clock::now());
                 }
